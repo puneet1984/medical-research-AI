@@ -1,7 +1,14 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { config } from '../config.js';
 import { MedicalDocument } from './searchService.js';
-import { generateEmbedding, generateEmbeddingAsync, cosineSimilarity, EMBEDDING_DIMENSION } from './embeddingService.js';
+import {
+  generateEmbedding,
+  generateEmbeddingAsync,
+  cosineSimilarity,
+  EMBEDDING_DIMENSION,
+  getActiveEmbeddingInfo,
+  setEmbeddingDimension
+} from './embeddingService.js';
 
 export const COLLECTION_NAME = 'medical_workspace';
 
@@ -83,10 +90,24 @@ let cachedSchemaVerification: QdrantSchemaVerification = {
 };
 
 /**
+ * Resets in-memory vector cache to prevent mixing vectors from different models
+ */
+export function clearVectorStore(): void {
+  memoryStore.clear();
+  totalEvictedCount = 0;
+  console.log('[vectorService] In-memory vector store cleared to maintain uniform model embedding space.');
+}
+
+/**
  * Initializes Qdrant client, validates collection existence,
+ * checks and enforces exact vector dimension compatibility with the active embedding model,
  * and ensures all tables, vector parameters, and payload column indexes are in place.
  */
 export async function initQdrant(): Promise<boolean> {
+  const activeInfo = getActiveEmbeddingInfo();
+  const requiredDimension = activeInfo.dimension;
+  setEmbeddingDimension(requiredDimension);
+
   try {
     qdrantClient = new QdrantClient({
       url: config.qdrantUrl,
@@ -99,10 +120,10 @@ export async function initQdrant(): Promise<boolean> {
     const collectionExists = collectionsRes.collections.some(c => c.name === COLLECTION_NAME);
 
     if (!collectionExists) {
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' not found. Creating collection with schema...`);
+      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' not found. Creating collection with size: ${requiredDimension} for model '${activeInfo.model}'...`);
       await qdrantClient.createCollection(COLLECTION_NAME, {
         vectors: {
-          size: EMBEDDING_DIMENSION,
+          size: requiredDimension,
           distance: 'Cosine'
         },
         optimizers_config: {
@@ -113,9 +134,52 @@ export async function initQdrant(): Promise<boolean> {
           ef_construct: 100
         }
       });
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' created successfully.`);
+      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' created successfully with size ${requiredDimension}.`);
     } else {
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' confirmed existing.`);
+      // 1b. Check existing dimension in Qdrant to ensure exact match with active embedding model
+      let existingQdrantDim: number | null = null;
+      try {
+        const collectionInfo = await qdrantClient.getCollection(COLLECTION_NAME);
+        const vParams = (collectionInfo as any)?.config?.params?.vectors;
+        if (typeof vParams?.size === 'number') {
+          existingQdrantDim = vParams.size;
+        } else if (typeof vParams === 'object' && vParams !== null) {
+          const firstKey = Object.keys(vParams)[0];
+          if (firstKey && typeof (vParams as any)[firstKey]?.size === 'number') {
+            existingQdrantDim = (vParams as any)[firstKey].size;
+          }
+        }
+      } catch (collErr) {
+        console.warn('[vectorService] Could not inspect Qdrant collection vector parameters:', collErr);
+      }
+
+      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' exists. Qdrant dimension: ${existingQdrantDim}, Required: ${requiredDimension} (${activeInfo.model}).`);
+
+      // Enforce dimension consistency: if existing dimension differs, recreate to prevent storage & retrieval failures
+      if (existingQdrantDim && existingQdrantDim !== requiredDimension) {
+        console.warn(`[vectorService] DIMENSION MISMATCH: Qdrant collection '${COLLECTION_NAME}' has size ${existingQdrantDim}, but active model '${activeInfo.model}' uses ${requiredDimension}-d.`);
+        console.log(`[vectorService] Recreating collection '${COLLECTION_NAME}' with size ${requiredDimension} so storage and retrieval do not fail...`);
+        try {
+          await qdrantClient.deleteCollection(COLLECTION_NAME);
+          await qdrantClient.createCollection(COLLECTION_NAME, {
+            vectors: {
+              size: requiredDimension,
+              distance: 'Cosine'
+            },
+            optimizers_config: {
+              default_segment_number: 2
+            },
+            hnsw_config: {
+              m: 16,
+              ef_construct: 100
+            }
+          });
+          console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' successfully recreated with size ${requiredDimension} for model '${activeInfo.model}'.`);
+          clearVectorStore();
+        } catch (recreateErr) {
+          console.error('[vectorService] Failed to recreate collection with matching dimension:', recreateErr);
+        }
+      }
     }
 
     // 2. Verify all payload columns (indexes) for structured clinical metadata
@@ -480,6 +544,7 @@ export const vectorService = {
   COLLECTION_NAME,
   MAX_VECTOR_CAPACITY,
   initQdrant,
+  clearVectorStore,
   upsertDocuments,
   searchSimilar,
   findCachedSimilar,

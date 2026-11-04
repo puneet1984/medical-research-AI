@@ -1,7 +1,92 @@
 import { config } from '../config.js';
 import { GoogleGenAI } from '@google/genai';
 
-export const EMBEDDING_DIMENSION = 384;
+export let EMBEDDING_DIMENSION = 768;
+
+export function setEmbeddingDimension(dim: number): void {
+  if (dim > 0 && dim !== EMBEDDING_DIMENSION) {
+    console.log(`[embeddingService] Vector dimension updated from ${EMBEDDING_DIMENSION} to ${dim}`);
+    EMBEDDING_DIMENSION = dim;
+  }
+}
+
+/**
+ * Resolves the native vector dimension for a given embedding provider and model name.
+ * Google text-embedding-004: 768 dimensions
+ * BioBERT / PubMedBERT: 768 dimensions
+ * all-MiniLM-L6-v2: 384 dimensions
+ * OpenAI text-embedding-3-small: 1536 (or requested 768/384)
+ * Nomic Embed Text: 768 dimensions
+ * Local Biomedical Hash: defaults to 768 (or matches collection)
+ */
+export function getModelNativeDimension(provider: string, modelName: string): number {
+  const p = (provider || '').toLowerCase();
+  const m = (modelName || '').toLowerCase();
+
+  if (p === 'gemini') return 768; // text-embedding-004 is 768-d
+  if (p === 'ollama') {
+    if (m.includes('minilm') || m.includes('384')) return 384;
+    return 768; // nomic-embed-text is 768-d
+  }
+  if (p === 'huggingface') {
+    if (m.includes('minilm') || m.includes('384') || m.includes('small')) return 384;
+    if (m.includes('large') || m.includes('1024')) return 1024;
+    return 768; // BioBERT, PubMedBERT are 768-d
+  }
+  if (p === 'openrouter') {
+    if (m.includes('minilm') || m.includes('384')) return 384;
+    if (m.includes('large') && !m.includes('bge')) return 3072;
+    if (m.includes('1024') || m.includes('cohere') || m.includes('bge-large')) return 1024;
+    if (m.includes('text-embedding-3-small')) return 768;
+    return 768;
+  }
+  if (p === 'local') {
+    return 768; // Default local dimension aligned with text-embedding-004 & BioBERT
+  }
+  return 768;
+}
+
+/**
+ * Resolves the single active embedding provider, model, and target vector dimension.
+ * Guaranteed consistent across indexing and queries to prevent vector space corruption.
+ */
+export function getActiveEmbeddingInfo(): { provider: 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local'; model: string; dimension: number } {
+  let provider = config.embeddingProvider as any;
+  let model = 'text-embedding-004';
+
+  if (provider === 'auto') {
+    if (process.env.GEMINI_API_KEY || config.geminiApiKey) {
+      provider = 'gemini';
+      model = config.geminiEmbeddingModel || 'text-embedding-004';
+    } else if (config.ollamaUrl && config.ollamaUrl !== 'http://localhost:11434') {
+      provider = 'ollama';
+      model = config.ollamaEmbeddingModel || 'nomic-embed-text';
+    } else if (config.openRouterApiKey) {
+      provider = 'openrouter';
+      model = config.openRouterEmbeddingModel || 'openai/text-embedding-3-small';
+    } else if (config.huggingFaceApiKey) {
+      provider = 'huggingface';
+      model = config.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed';
+    } else {
+      provider = 'local';
+      model = 'biomedical-dense-hash-768';
+    }
+  } else if (provider === 'gemini') {
+    model = config.geminiEmbeddingModel || 'text-embedding-004';
+  } else if (provider === 'huggingface') {
+    model = config.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed';
+  } else if (provider === 'openrouter') {
+    model = config.openRouterEmbeddingModel || 'openai/text-embedding-3-small';
+  } else if (provider === 'ollama') {
+    model = config.ollamaEmbeddingModel || 'nomic-embed-text';
+  } else {
+    provider = 'local';
+    model = 'biomedical-dense-hash-768';
+  }
+
+  const dimension = getModelNativeDimension(provider, model);
+  return { provider, model, dimension };
+}
 
 /**
  * Standard list of clinical and biomedical keyword weights for domain-specific RAG tuning.
@@ -255,9 +340,10 @@ async function fetchGeminiEmbedding(text: string): Promise<number[]> {
   const apiKey = process.env.GEMINI_API_KEY || config.geminiApiKey;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
 
+  const model = config.geminiEmbeddingModel || 'text-embedding-004';
   const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
   const response = await ai.models.embedContent({
-    model: 'text-embedding-004',
+    model,
     contents: text.slice(0, 4000)
   });
 
@@ -269,80 +355,89 @@ async function fetchGeminiEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Async master embedding generator: Gemini (Free) -> Ollama (Local Free) -> OpenRouter -> Hugging Face -> Local Fallback
+ * Master embedding generator: Enforces a consistent single active embedding model
+ * across all document indexing and search queries to guarantee vector space coherence
+ * and prevent storage or retrieval failures.
  */
 export async function generateEmbeddingAsync(text: string): Promise<{
   vector: number[];
   provider: 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local';
   model: string;
 }> {
-  const providerPref = config.embeddingProvider as string;
+  const active = getActiveEmbeddingInfo();
+  const targetDim = EMBEDDING_DIMENSION;
 
-  // 1. Google Gemini Embeddings (Free tier: 1500 RPM on Google AI Studio)
-  if (providerPref === 'gemini' || (providerPref === 'auto' && (process.env.GEMINI_API_KEY || config.geminiApiKey))) {
+  // 1. Google Gemini Embeddings (text-embedding-004: Native 768-d)
+  if (active.provider === 'gemini') {
     try {
-      const vector = await fetchGeminiEmbedding(text);
+      const rawVector = await fetchGeminiEmbedding(text);
       return {
-        vector,
+        vector: normalizeOrResizeVector(rawVector, targetDim),
         provider: 'gemini',
-        model: 'text-embedding-004'
+        model: active.model
       };
     } catch (err) {
-      console.warn('[embeddingService] Gemini embeddings notice, trying next provider:', err instanceof Error ? err.message : err);
-      if (providerPref === 'gemini') {
-        // Fall back to local
-      }
+      console.warn(`[embeddingService] Google Gemini (${active.model}) error:`, err instanceof Error ? err.message : err);
+      // Fallback to local biomedical projection at exact same dimension
+      const fallback = generateLocalEmbedding(text, targetDim);
+      return { vector: fallback, provider: 'local', model: `${active.model}-local-aligned` };
     }
   }
 
-  // 2. Ollama Embeddings (Free local engine)
-  if (providerPref === 'ollama') {
+  // 2. Ollama Embeddings
+  if (active.provider === 'ollama') {
     try {
-      const vector = await fetchOllamaEmbedding(text);
+      const rawVector = await fetchOllamaEmbedding(text);
       return {
-        vector,
+        vector: normalizeOrResizeVector(rawVector, targetDim),
         provider: 'ollama',
-        model: config.ollamaEmbeddingModel
+        model: active.model
       };
     } catch (err) {
-      console.warn('[embeddingService] Ollama embeddings failed:', err instanceof Error ? err.message : err);
+      console.warn(`[embeddingService] Ollama (${active.model}) error:`, err instanceof Error ? err.message : err);
+      const fallback = generateLocalEmbedding(text, targetDim);
+      return { vector: fallback, provider: 'local', model: `${active.model}-local-aligned` };
     }
   }
 
   // 3. OpenRouter Embeddings
-  if (providerPref === 'openrouter' || (providerPref === 'auto' && config.openRouterApiKey)) {
+  if (active.provider === 'openrouter') {
     try {
-      const vector = await fetchOpenRouterEmbedding(text);
+      const rawVector = await fetchOpenRouterEmbedding(text);
       return {
-        vector,
+        vector: normalizeOrResizeVector(rawVector, targetDim),
         provider: 'openrouter',
-        model: config.openRouterEmbeddingModel
+        model: active.model
       };
     } catch (err) {
-      console.warn('[embeddingService] OpenRouter embeddings notice, trying secondary provider:', err instanceof Error ? err.message : err);
+      console.warn(`[embeddingService] OpenRouter (${active.model}) error:`, err instanceof Error ? err.message : err);
+      const fallback = generateLocalEmbedding(text, targetDim);
+      return { vector: fallback, provider: 'local', model: `${active.model}-local-aligned` };
     }
   }
 
   // 4. Hugging Face Embeddings
-  if (providerPref === 'huggingface' || (providerPref === 'auto' && config.huggingFaceApiKey)) {
+  if (active.provider === 'huggingface') {
     try {
-      const vector = await fetchHuggingFaceEmbedding(text);
+      const rawVector = await fetchHuggingFaceEmbedding(text);
       return {
-        vector,
+        vector: normalizeOrResizeVector(rawVector, targetDim),
         provider: 'huggingface',
-        model: config.huggingFaceEmbeddingModel
+        model: active.model
       };
     } catch (err) {
-      console.warn('[embeddingService] HuggingFace embeddings notice, using local pipeline:', err instanceof Error ? err.message : err);
+      console.warn(`[embeddingService] Hugging Face (${active.model}) error:`, err instanceof Error ? err.message : err);
+      const fallback = generateLocalEmbedding(text, targetDim);
+      return { vector: fallback, provider: 'local', model: `${active.model}-local-aligned` };
     }
   }
 
-  // 5. Deterministic Local Biomedical Embedding (100% Free, Zero Setup, Zero Latency)
-  const vector = generateLocalEmbedding(text, EMBEDDING_DIMENSION);
+  // 5. Deterministic Local Biomedical Embedding
+  const vector = generateLocalEmbedding(text, targetDim);
   return {
     vector,
     provider: 'local',
-    model: 'biomedical-dense-hash-384'
+    model: active.model
   };
 }
 

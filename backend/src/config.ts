@@ -35,7 +35,8 @@ export const config = {
   ncbiApiKey: process.env.NCBI_API_KEY || '',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   // Embeddings configuration
-  embeddingProvider: process.env.EMBEDDING_PROVIDER || 'auto', // 'auto' | 'openrouter' | 'huggingface' | 'ollama' | 'local'
+  embeddingProvider: process.env.EMBEDDING_PROVIDER || 'auto', // 'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'
+  geminiEmbeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004',
   openRouterEmbeddingModel: process.env.OPENROUTER_EMBEDDING_MODEL || 'openai/text-embedding-3-small',
   huggingFaceApiKey: process.env.HUGGINGFACE_API_KEY || '',
   huggingFaceEmbeddingModel: process.env.HUGGINGFACE_EMBEDDING_MODEL || 'sentence-transformers/all-MiniLM-L6-v2'
@@ -105,6 +106,7 @@ export function savePersistentSettings(): void {
       scholarlyEmail: config.scholarlyEmail,
       ncbiApiKey: config.ncbiApiKey,
       embeddingProvider: config.embeddingProvider,
+      geminiEmbeddingModel: config.geminiEmbeddingModel,
       openRouterEmbeddingModel: config.openRouterEmbeddingModel,
       huggingFaceApiKey: config.huggingFaceApiKey,
       huggingFaceEmbeddingModel: config.huggingFaceEmbeddingModel,
@@ -154,6 +156,7 @@ export function getSanitizedConfig() {
     isOmniRouteConfigured: Boolean(config.omniRouteApiKey),
     omniRouteLlmModel: config.omniRouteLlmModel,
     embeddingProvider: config.embeddingProvider,
+    geminiEmbeddingModel: config.geminiEmbeddingModel,
     openRouterEmbeddingModel: config.openRouterEmbeddingModel,
     huggingFaceApiKeyMasked: maskKey(config.huggingFaceApiKey),
     isHuggingFaceConfigured: Boolean(config.huggingFaceApiKey),

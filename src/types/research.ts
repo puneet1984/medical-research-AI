@@ -115,6 +115,7 @@ export interface SettingsData {
   isOpenRouterConfigured: boolean;
   geminiApiKeyMasked: string;
   isGeminiConfigured: boolean;
+  geminiEmbeddingModel?: string;
   ollamaUrl: string;
   ollamaLlmModel: string;
   ollamaEmbeddingModel: string;
@@ -161,5 +162,34 @@ export interface PaperDraft {
   date: string;
   sections: PaperSection[];
   totalWords: number;
+}
+
+export interface OpenRouterModelOption {
+  id: string;
+  name: string;
+  description?: string;
+  contextLength?: number;
+  pricing?: {
+    prompt: string;
+    completion: string;
+    isFree: boolean;
+  };
+  outputModalities?: string[];
+  isFree: boolean;
+  isReasoning: boolean;
+  isEmbedding: boolean;
+}
+
+export interface OpenRouterModelsResponse {
+  success: boolean;
+  count: number;
+  models: OpenRouterModelOption[];
+  categories: {
+    freeText: OpenRouterModelOption[];
+    allText: OpenRouterModelOption[];
+    freeEmbeddings: OpenRouterModelOption[];
+    allEmbeddings: OpenRouterModelOption[];
+    reasoning: OpenRouterModelOption[];
+  };
 }
 

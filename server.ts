@@ -12,6 +12,7 @@ import {
   handleHealth,
   handleGetSettings,
   handleUpdateSettings,
+  handleGetOpenRouterModels,
   handleTestConnection,
   handleGeneratePaperDraft,
   handleSectionAction
@@ -37,6 +38,8 @@ app.post('/api/vector-search', handleVectorSearch);
 // Settings & Runtime Configuration
 app.get('/api/settings', handleGetSettings);
 app.post('/api/settings', handleUpdateSettings);
+app.get('/api/settings/openrouter-models', handleGetOpenRouterModels);
+app.get('/api/openrouter/models', handleGetOpenRouterModels);
 app.post('/api/settings/test-connection', handleTestConnection);
 
 // AI Editor & Writer Endpoints

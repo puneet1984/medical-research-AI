@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { expandQuery } from '../agents/queryAgent.js';
 import { searchAllAvailableStudies, searchMedicalLiterature, MedicalDocument } from '../services/searchService.js';
-import { upsertDocuments, searchSimilar, findCachedSimilar, getVectorStatus } from '../services/vectorService.js';
+import { upsertDocuments, searchSimilar, findCachedSimilar, getVectorStatus, initQdrant } from '../services/vectorService.js';
 import { synthesizeLiterature } from '../agents/synthesisAgent.js';
 
 interface SessionQueryStudies {
@@ -251,7 +251,7 @@ export function handleHealth(_req: Request, res: Response): void {
 // -------------------------------------------------------------
 
 import { getSanitizedConfig, updateRuntimeConfig } from '../config.js';
-import { testConnection } from '../services/openRouterService.js';
+import { testConnection, fetchOpenRouterModels } from '../services/openRouterService.js';
 import {
   generatePaperDraft,
   transformSection
@@ -273,6 +273,14 @@ export function handleUpdateSettings(req: Request, res: Response): void {
     }
 
     const updated = updateRuntimeConfig(updates);
+
+    // If Qdrant settings changed, re-initialize vector connection in background
+    if (updates.qdrantUrl !== undefined || updates.qdrantApiKey !== undefined) {
+      initQdrant().catch(err => {
+        console.warn('[researchController] Qdrant re-init notice:', err);
+      });
+    }
+
     res.json({
       success: true,
       message: 'Runtime environment settings successfully applied',
@@ -284,11 +292,50 @@ export function handleUpdateSettings(req: Request, res: Response): void {
   }
 }
 
+export async function handleGetOpenRouterModels(req: Request, res: Response): Promise<void> {
+  try {
+    const refresh = req.query.refresh === 'true';
+    const modality = typeof req.query.modality === 'string' ? req.query.modality : undefined;
+    const variant = typeof req.query.variant === 'string' ? req.query.variant : undefined;
+
+    const data = await fetchOpenRouterModels(refresh);
+
+    let filtered = data.all;
+    if (modality === 'embeddings') {
+      filtered = variant === 'free' ? data.freeEmbeddings : data.allEmbeddings;
+    } else if (modality === 'text') {
+      filtered = variant === 'free' ? data.freeText : data.allText;
+    } else if (variant === 'free') {
+      filtered = filtered.filter(m => m.isFree);
+    }
+
+    res.json({
+      success: true,
+      count: filtered.length,
+      models: filtered,
+      categories: {
+        freeText: data.freeText,
+        allText: data.allText,
+        freeEmbeddings: data.freeEmbeddings,
+        allEmbeddings: data.allEmbeddings,
+        reasoning: data.reasoning
+      }
+    });
+  } catch (err) {
+    console.error('[researchController] Get OpenRouter models error:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch OpenRouter models',
+      details: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+
 export async function handleTestConnection(req: Request, res: Response): Promise<void> {
   try {
     const { target, params } = req.body;
     if (!target) {
-      res.status(400).json({ error: 'Target service required (ollama, omniroute, openrouter, gemini)' });
+      res.status(400).json({ error: 'Target service required (ollama, omniroute, openrouter, gemini, huggingface, qdrant, ncbi)' });
       return;
     }
 
@@ -376,6 +423,7 @@ export const researchController = {
   handleHealth,
   handleGetSettings,
   handleUpdateSettings,
+  handleGetOpenRouterModels,
   handleTestConnection,
   handleGeneratePaperDraft,
   handleSectionAction
