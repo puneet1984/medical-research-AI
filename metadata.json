@@ -1,0 +1,6 @@
+{
+  "name": "MedResearch AI - Clinical Evidence & Literature Synthesis",
+  "description": "Medical literature research and clinical synthesis platform by Dr. Puneet Maheshwari. Powered by OpenAlex, PubMed, vector embeddings, and PICO trial analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
