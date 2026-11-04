@@ -122,7 +122,7 @@ export interface SettingsData {
   omniRouteApiKeyMasked: string;
   isOmniRouteConfigured: boolean;
   omniRouteLlmModel: string;
-  embeddingProvider: 'auto' | 'openrouter' | 'huggingface' | 'ollama' | 'local';
+  embeddingProvider: 'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local';
   openRouterEmbeddingModel: string;
   huggingFaceApiKeyMasked: string;
   isHuggingFaceConfigured: boolean;

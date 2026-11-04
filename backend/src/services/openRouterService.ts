@@ -351,6 +351,30 @@ export async function testConnection(target: 'ollama' | 'omniroute' | 'openroute
       return { success: Boolean(resp.text), message: 'Gemini 3.8 Flash operational' };
     }
 
+    if (target === 'huggingface') {
+      const model = params?.model || config.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed';
+      const apiKey = params?.apiKey || config.huggingFaceApiKey;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const res = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ inputs: 'Medical embedding test passage', options: { wait_for_model: true } }),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.ok) {
+        return { success: true, message: `Hugging Face model ${model} verified and reachable` };
+      }
+      const errText = await res.text();
+      let guidance = '';
+      if (res.status === 410) {
+        guidance = ' (Notice: This model repository has been deprecated on HF Serverless fleet. Switch to Gemini text-embedding-004 or the built-in Local Biomedical engine).';
+      } else if (res.status === 402) {
+        guidance = ' (Notice: Hugging Face now requires paid PRO credits for this model provider. Switch to Gemini text-embedding-004 [Free Tier] or the Local Biomedical engine [100% Free]).';
+      }
+      return { success: false, message: `Hugging Face HTTP ${res.status}: ${errText.slice(0, 120)}${guidance}` };
+    }
+
     return { success: false, message: `Unknown target ${target}` };
   } catch (err) {
     return {

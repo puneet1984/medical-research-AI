@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { GoogleGenAI } from '@google/genai';
 
 export const EMBEDDING_DIMENSION = 384;
 
@@ -145,13 +146,39 @@ async function fetchHuggingFaceEmbedding(text: string): Promise<number[]> {
   }
 
   const raw = await res.json();
-  // HF feature-extraction can return 1D array or 2D array [1, dim]
+  // HF feature-extraction can return:
+  // 1. 1D array: [dim] (standard sentence transformers like all-MiniLM-L6-v2)
+  // 2. 2D array: [1, dim] or [seq_len, dim] (e.g. token matrix)
+  // 3. 3D array: [1, seq_len, dim] (e.g. raw BERT models like monologg/biobert_v1.1_pubmed)
   let vector: number[] = [];
   if (Array.isArray(raw)) {
     if (typeof raw[0] === 'number') {
       vector = raw;
     } else if (Array.isArray(raw[0]) && typeof raw[0][0] === 'number') {
-      vector = raw[0];
+      if (raw.length === 1) {
+        vector = raw[0];
+      } else {
+        // Mean pooling over token sequence: [seq_len, dim]
+        const seqLen = raw.length;
+        const dim = raw[0].length;
+        const pooled = new Float64Array(dim);
+        for (let t = 0; t < seqLen; t++) {
+          const tokenVec = raw[t];
+          for (let d = 0; d < dim; d++) pooled[d] += tokenVec[d];
+        }
+        vector = Array.from(pooled).map(v => v / seqLen);
+      }
+    } else if (Array.isArray(raw[0]) && Array.isArray(raw[0][0]) && typeof raw[0][0][0] === 'number') {
+      // 3D tensor [batch=1, seq_len, dim] from raw BioBERT
+      const tokens = raw[0];
+      const seqLen = tokens.length;
+      const dim = tokens[0].length;
+      const pooled = new Float64Array(dim);
+      for (let t = 0; t < seqLen; t++) {
+        const tokenVec = tokens[t];
+        for (let d = 0; d < dim; d++) pooled[d] += tokenVec[d];
+      }
+      vector = Array.from(pooled).map(v => v / seqLen);
     }
   }
 
@@ -222,16 +249,53 @@ async function fetchOllamaEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Async master embedding generator: Ollama -> OpenRouter -> Hugging Face -> Local Fallback
+ * Fetches 768-d embedding from Google Gemini (text-embedding-004) - free tier via Google AI Studio
+ */
+async function fetchGeminiEmbedding(text: string): Promise<number[]> {
+  const apiKey = process.env.GEMINI_API_KEY || config.geminiApiKey;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
+
+  const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+  const response = await ai.models.embedContent({
+    model: 'text-embedding-004',
+    contents: text.slice(0, 4000)
+  });
+
+  const values = response.embeddings?.[0]?.values;
+  if (Array.isArray(values) && values.length > 0) {
+    return normalizeOrResizeVector(values, EMBEDDING_DIMENSION);
+  }
+  throw new Error('Invalid embedding vector returned from Gemini');
+}
+
+/**
+ * Async master embedding generator: Gemini (Free) -> Ollama (Local Free) -> OpenRouter -> Hugging Face -> Local Fallback
  */
 export async function generateEmbeddingAsync(text: string): Promise<{
   vector: number[];
-  provider: 'ollama' | 'openrouter' | 'huggingface' | 'local';
+  provider: 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local';
   model: string;
 }> {
-  const providerPref = config.embeddingProvider;
+  const providerPref = config.embeddingProvider as string;
 
-  // 1. Ollama Embeddings
+  // 1. Google Gemini Embeddings (Free tier: 1500 RPM on Google AI Studio)
+  if (providerPref === 'gemini' || (providerPref === 'auto' && (process.env.GEMINI_API_KEY || config.geminiApiKey))) {
+    try {
+      const vector = await fetchGeminiEmbedding(text);
+      return {
+        vector,
+        provider: 'gemini',
+        model: 'text-embedding-004'
+      };
+    } catch (err) {
+      console.warn('[embeddingService] Gemini embeddings notice, trying next provider:', err instanceof Error ? err.message : err);
+      if (providerPref === 'gemini') {
+        // Fall back to local
+      }
+    }
+  }
+
+  // 2. Ollama Embeddings (Free local engine)
   if (providerPref === 'ollama') {
     try {
       const vector = await fetchOllamaEmbedding(text);
@@ -245,7 +309,7 @@ export async function generateEmbeddingAsync(text: string): Promise<{
     }
   }
 
-  // 2. OpenRouter Embeddings
+  // 3. OpenRouter Embeddings
   if (providerPref === 'openrouter' || (providerPref === 'auto' && config.openRouterApiKey)) {
     try {
       const vector = await fetchOpenRouterEmbedding(text);
@@ -259,7 +323,7 @@ export async function generateEmbeddingAsync(text: string): Promise<{
     }
   }
 
-  // 3. Hugging Face Embeddings
+  // 4. Hugging Face Embeddings
   if (providerPref === 'huggingface' || (providerPref === 'auto' && config.huggingFaceApiKey)) {
     try {
       const vector = await fetchHuggingFaceEmbedding(text);
@@ -273,7 +337,7 @@ export async function generateEmbeddingAsync(text: string): Promise<{
     }
   }
 
-  // 4. Deterministic Local Biomedical Embedding
+  // 5. Deterministic Local Biomedical Embedding (100% Free, Zero Setup, Zero Latency)
   const vector = generateLocalEmbedding(text, EMBEDDING_DIMENSION);
   return {
     vector,

@@ -53,7 +53,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [omniRouteLlmModel, setOmniRouteLlmModel] = useState('deepseek/deepseek-r1');
 
   // Embeddings
-  const [embeddingProvider, setEmbeddingProvider] = useState<'auto' | 'openrouter' | 'huggingface' | 'ollama' | 'local'>('auto');
+  const [embeddingProvider, setEmbeddingProvider] = useState<'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'>('auto');
   const [openRouterEmbeddingModel, setOpenRouterEmbeddingModel] = useState('openai/text-embedding-3-small');
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('');
   const [huggingFaceMasked, setHuggingFaceMasked] = useState('');
@@ -119,7 +119,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  const handleTest = async (target: 'ollama' | 'omniroute' | 'openrouter' | 'gemini') => {
+  const handleTest = async (target: 'ollama' | 'omniroute' | 'openrouter' | 'gemini' | 'huggingface') => {
     setTestStatus(prev => ({ ...prev, [target]: { loading: true } }));
     try {
       const params: Record<string, string> = {};
@@ -129,6 +129,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         if (omniRouteApiKey) params.apiKey = omniRouteApiKey;
       }
       if (target === 'openrouter' && openRouterApiKey) params.apiKey = openRouterApiKey;
+      if (target === 'huggingface') {
+        params.model = huggingFaceEmbeddingModel;
+        if (huggingFaceApiKey) params.apiKey = huggingFaceApiKey;
+      }
 
       const res = await fetch('/api/settings/test-connection', {
         method: 'POST',
@@ -524,24 +528,43 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* Section 5: Vector Embeddings Engine */}
           <div className="border border-slate-200 rounded-lg p-4 bg-slate-50/50">
-            <div className="flex items-center gap-2 mb-3">
-              <Layers className="w-4 h-4 text-teal-600" />
-              <h3 className="font-semibold text-slate-900 text-sm">Vector Embeddings Provider</h3>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Layers className="w-4 h-4 text-teal-600" />
+                <h3 className="font-semibold text-slate-900 text-sm">Vector Embeddings Provider</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleTest('huggingface')}
+                disabled={testStatus.huggingface?.loading}
+                className="text-[11px] px-2.5 py-1 bg-teal-50 text-teal-700 hover:bg-teal-100 border border-teal-200 rounded font-medium transition-colors flex items-center gap-1 disabled:opacity-50"
+              >
+                {testStatus.huggingface?.loading && <RefreshCw className="w-3 h-3 animate-spin" />}
+                <span>Test HF Model</span>
+              </button>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
+            {testStatus.huggingface && (
+              <div className={`p-2.5 mb-3 rounded text-xs flex items-center gap-1.5 ${testStatus.huggingface.success ? 'bg-teal-50 text-teal-800 border border-teal-200' : 'bg-red-50 text-red-700 border border-red-200'}`}>
+                {testStatus.huggingface.success ? <CheckCircle2 className="w-3.5 h-3.5 text-teal-600" /> : <AlertCircle className="w-3.5 h-3.5 text-red-500" />}
+                <span>{testStatus.huggingface.message}</span>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
               {[
                 { id: 'auto', label: 'Auto (Optimal)' },
-                { id: 'ollama', label: 'Ollama Embed' },
+                { id: 'local', label: 'Local (100% Free)' },
+                { id: 'gemini', label: 'Gemini (Free Tier)' },
+                { id: 'ollama', label: 'Ollama (Local)' },
                 { id: 'openrouter', label: 'OpenRouter' },
-                { id: 'huggingface', label: 'Hugging Face' },
-                { id: 'local', label: 'Local (384-d)' }
+                { id: 'huggingface', label: 'Hugging Face' }
               ].map(item => (
                 <button
                   key={item.id}
                   type="button"
                   onClick={() => setEmbeddingProvider(item.id as any)}
-                  className={`px-3 py-2 text-xs font-medium rounded-lg border text-center transition-all ${
+                  className={`px-2.5 py-2 text-xs font-medium rounded-lg border text-center transition-all ${
                     embeddingProvider === item.id
                       ? 'bg-teal-600 text-white border-teal-600 shadow-xs'
                       : 'bg-white text-slate-700 border-slate-200 hover:border-teal-300'
@@ -552,7 +575,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               ))}
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
                   OpenRouter Embedding Model
@@ -568,15 +591,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Hugging Face User Access Token (Free) {huggingFaceMasked && <span className="text-slate-400 font-mono">({huggingFaceMasked})</span>}
+                </label>
+                <input
+                  type="password"
+                  value={huggingFaceApiKey}
+                  onChange={e => setHuggingFaceApiKey(e.target.value)}
+                  placeholder="hf_..."
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-teal-500 focus:outline-none"
+                />
+                <span className="text-[10px] text-slate-500">Free from huggingface.co/settings/tokens (no billing needed)</span>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
                   Hugging Face Embedding Model
                 </label>
                 <input
                   type="text"
                   value={huggingFaceEmbeddingModel}
                   onChange={e => setHuggingFaceEmbeddingModel(e.target.value)}
-                  placeholder="sentence-transformers/all-MiniLM-L6-v2"
+                  placeholder="monologg/biobert_v1.1_pubmed"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-teal-500 focus:outline-none"
                 />
+              </div>
+            </div>
+
+            {/* Biomedical Model Preset Shortcuts */}
+            <div className="pt-2 border-t border-slate-200/80">
+              <span className="text-[11px] font-semibold text-slate-600 block mb-1.5">
+                Recommended Biomedical &amp; Clinical Embedding Models:
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { id: 'monologg/biobert_v1.1_pubmed', label: 'monologg/biobert_v1.1_pubmed (BioBERT PubMed 768-d)' },
+                  { id: 'NeuML/pubmedbert-base-embeddings', label: 'NeuML/pubmedbert-base-embeddings (SOTA Clinical 768-d)' },
+                  { id: 'pritamdeka/S-BioBert-snli-multinli-stsb', label: 'pritamdeka/S-BioBert (Sentence BioBERT 768-d)' },
+                  { id: 'sentence-transformers/all-MiniLM-L6-v2', label: 'all-MiniLM-L6-v2 (Fast 384-d)' }
+                ].map(preset => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => {
+                      setHuggingFaceEmbeddingModel(preset.id);
+                      setEmbeddingProvider('huggingface');
+                    }}
+                    className={`px-2 py-1 text-[11px] font-mono rounded border transition-colors ${
+                      huggingFaceEmbeddingModel === preset.id
+                        ? 'bg-teal-100 text-teal-800 border-teal-300 font-semibold'
+                        : 'bg-white text-slate-600 border-slate-200 hover:border-teal-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
