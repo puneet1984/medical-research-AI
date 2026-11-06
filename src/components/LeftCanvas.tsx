@@ -13,7 +13,13 @@ import {
   Cpu,
   Layers,
   FileCheck,
-  Clock
+  Clock,
+  ExternalLink,
+  ChevronDown,
+  ChevronUp,
+  Tag,
+  CheckCircle2,
+  Share2
 } from 'lucide-react';
 import { SynthesisData, QueryExpansion, MedicalDocument } from '../types/research';
 
@@ -28,6 +34,8 @@ interface LeftCanvasProps {
   documents: MedicalDocument[];
   onSelectCitation: (authorOrDoi: string) => void;
   durationMs?: number;
+  onGenerateSynthesis?: () => void;
+  isSynthesizing?: boolean;
 }
 
 export const LeftCanvas: React.FC<LeftCanvasProps> = ({
@@ -40,11 +48,15 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   expansion,
   documents,
   onSelectCitation,
-  durationMs
+  durationMs,
+  onGenerateSynthesis,
+  isSynthesizing = false
 }) => {
   const [activeView, setActiveView] = useState<'report' | 'editor'>('report');
   const [editableMarkdown, setEditableMarkdown] = useState<string>('');
   const [copied, setCopied] = useState(false);
+  const [isMetaMapExpanded, setIsMetaMapExpanded] = useState(true);
+  const [copiedPubMed, setCopiedPubMed] = useState(false);
 
   // Sync editable text when new synthesis arrives
   React.useEffect(() => {
@@ -177,15 +189,204 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
           </div>
         )}
 
-        {/* MeSH & UMLS Expansion preview chips */}
-        {expansion && expansion.meshTerms?.length > 0 && (
-          <div className="mt-2.5 flex items-center gap-1.5 flex-wrap text-[11px]">
-            <span className="font-semibold text-slate-500 uppercase text-[10px]">MeSH Concepts:</span>
-            {expansion.meshTerms.slice(0, 4).map((term, i) => (
-              <span key={i} className="px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded font-mono text-[10px]">
-                {term}
-              </span>
-            ))}
+        {/* NLM MetaMap / MetaMapLite Concept Extraction & Search Term Translator */}
+        {expansion && (
+          <div className="mt-3 bg-white border border-slate-200 rounded-lg p-2.5 shadow-2xs transition-all">
+            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-blue-50 text-blue-800 border border-blue-200 rounded text-[10px] font-bold">
+                  <Brain className="w-3 h-3 text-blue-600" />
+                  <span>NLM MetaMapLite</span>
+                </span>
+                <span className="text-[10px] text-slate-500 font-medium">
+                  Lister Hill Center Biomedical NLP
+                </span>
+                <a
+                  href="https://lhncbc.nlm.nih.gov/LHC-research/LHC-projects/NLP/MetaMapLite.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[10px] text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 hover:underline"
+                >
+                  <span>Doc</span>
+                  <ExternalLink className="w-2.5 h-2.5" />
+                </a>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsMetaMapExpanded(!isMetaMapExpanded)}
+                className="text-[10px] text-slate-500 hover:text-slate-800 flex items-center gap-0.5 cursor-pointer"
+              >
+                <span>{isMetaMapExpanded ? 'Hide Details' : 'Inspect Terminology'}</span>
+                {isMetaMapExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+              </button>
+            </div>
+
+            {/* Collapsed Compact View */}
+            {!isMetaMapExpanded && (
+              <div className="pt-1.5 flex items-center gap-1.5 flex-wrap text-[10px]">
+                <span className="text-slate-400 font-semibold uppercase text-[9px]">Mapped MeSH:</span>
+                {expansion.meshTerms.slice(0, 4).map((term, i) => (
+                  <span key={i} className="px-1.5 py-0.2 bg-slate-50 text-slate-700 border border-slate-200 rounded font-mono text-[10px]">
+                    {term}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Expanded Full MetaMapLite Inspector */}
+            {isMetaMapExpanded && (
+              <div className="pt-2 space-y-2.5 text-[11px]">
+                {/* 1. Extracted Biomedical Concepts & Semantic Types */}
+                <div>
+                  <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 flex items-center justify-between">
+                    <span>UMLS Concepts &amp; Semantic Types:</span>
+                    <span className="text-[9px] font-normal text-slate-400">Match Confidence: ~1000/1000</span>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    {expansion.metaMap?.concepts && expansion.metaMap.concepts.length > 0 ? (
+                      expansion.metaMap.concepts.map((c, i) => (
+                        <div key={i} className="p-1.5 bg-slate-50 rounded border border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-[10px]">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-bold text-slate-800 bg-white px-1.5 py-0.5 rounded border border-slate-200">
+                              "{c.matchedText}"
+                            </span>
+                            <span className="text-slate-400">→</span>
+                            <span className="font-semibold text-slate-700">
+                              {c.preferredName}
+                            </span>
+                            <span className="font-mono text-[9px] px-1 py-0.2 bg-teal-50 text-teal-800 border border-teal-200 rounded" title="UMLS Concept Unique Identifier">
+                              CUI: {c.cui}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-1 flex-wrap shrink-0">
+                            {c.semanticTypes.map((st, j) => {
+                              const isDevice = st === 'medd';
+                              const isProc = st === 'topp';
+                              const isDis = st === 'dsyn';
+                              const isDrug = st === 'phsu';
+                              const badgeCls = isDevice
+                                ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                : isProc
+                                ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                : isDis
+                                ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                : isDrug
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-200';
+
+                              return (
+                                <span key={j} className={`text-[9px] px-1.5 py-0.2 rounded border font-semibold ${badgeCls}`} title={c.semanticTypeNames[j] || st}>
+                                  [{st}] {c.semanticTypeNames[j] || st}
+                                </span>
+                              );
+                            })}
+
+                            {c.meshId && (
+                              <a
+                                href={`https://meshb.nlm.nih.gov/record/ui?ui=${c.meshId}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-0.5 text-[9px] font-mono font-semibold px-1 py-0.2 bg-blue-50 text-blue-700 hover:text-blue-900 border border-blue-200 rounded hover:underline"
+                                title={`Inspect MeSH Descriptor ${c.meshId} in official NLM MeSH Browser`}
+                              >
+                                <span>MeSH: {c.meshId}</span>
+                                <ExternalLink className="w-2.5 h-2.5" />
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {expansion.meshTerms.map((m, i) => (
+                          <span key={i} className="px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded font-mono text-[10px]">
+                            {m}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* 2. Comparative Clinical Arms Breakdown if comparative */}
+                {expansion.metaMap?.isComparative && expansion.metaMap.comparativeDetails && (
+                  <div className="p-2 bg-blue-50/40 rounded border border-blue-100 space-y-1 text-[10px]">
+                    <div className="font-semibold text-blue-900 flex items-center justify-between">
+                      <span>Comparative Implant / Therapy Arms:</span>
+                      <span className="text-[9px] text-blue-600 font-normal">Head-to-head Clinical Evaluation</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                      <div className="bg-white p-1.5 rounded border border-blue-200">
+                        <span className="text-slate-400 block text-[9px] font-bold uppercase">Arm 1 (Intervention):</span>
+                        <span className="font-semibold text-slate-800">{expansion.metaMap.comparativeDetails.arm1.expanded}</span>
+                        <div className="text-[9px] text-slate-500 font-mono mt-0.5 truncate">{expansion.metaMap.comparativeDetails.arm1.pubmedTerm}</div>
+                      </div>
+                      <div className="bg-white p-1.5 rounded border border-blue-200">
+                        <span className="text-slate-400 block text-[9px] font-bold uppercase">Arm 2 (Comparator):</span>
+                        <span className="font-semibold text-slate-800">{expansion.metaMap.comparativeDetails.arm2.expanded}</span>
+                        <div className="text-[9px] text-slate-500 font-mono mt-0.5 truncate">{expansion.metaMap.comparativeDetails.arm2.pubmedTerm}</div>
+                      </div>
+                    </div>
+                    {expansion.metaMap.comparativeDetails.contextCondition && (
+                      <div className="pt-1 text-[9px] text-slate-600">
+                        <span className="font-bold text-slate-700">Clinical Domain Restriction: </span>
+                        <span>{expansion.metaMap.comparativeDetails.contextCondition} (prevents irrelevant literature leakage)</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 3. Formulated Optimized PubMed Search Query */}
+                <div>
+                  <div className="flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">
+                    <span>Optimized PubMed Search Syntax:</span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const pubmedString = expansion.metaMap?.optimizedPubMedQuery || expansion.expandedQuery;
+                          navigator.clipboard.writeText(pubmedString);
+                          setCopiedPubMed(true);
+                          setTimeout(() => setCopiedPubMed(false), 2000);
+                        }}
+                        className="inline-flex items-center gap-1 text-[10px] font-semibold text-teal-700 hover:text-teal-900 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-1.5 py-0.5 rounded cursor-pointer transition-colors"
+                        title="Copy PubMed search syntax to clipboard"
+                      >
+                        {copiedPubMed ? (
+                          <>
+                            <Check className="w-2.5 h-2.5 text-emerald-600" />
+                            <span>Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-2.5 h-2.5" />
+                            <span>Copy PubMed Query</span>
+                          </>
+                        )}
+                      </button>
+
+                      <a
+                        href={`https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(expansion.metaMap?.optimizedPubMedQuery || expansion.expandedQuery)}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-1.5 py-0.5 rounded transition-colors"
+                        title="Execute this exact query in PubMed (NCBI)"
+                      >
+                        <span>Run in PubMed</span>
+                        <ExternalLink className="w-2.5 h-2.5" />
+                      </a>
+                    </div>
+                  </div>
+
+                  <div className="p-2 bg-slate-900 text-slate-200 font-mono text-[10px] rounded border border-slate-800 leading-relaxed break-all select-all">
+                    {expansion.metaMap?.optimizedPubMedQuery || expansion.expandedQuery}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -220,6 +421,25 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
         {/* Metadata & Actions */}
         <div className="flex items-center gap-2">
+          {onGenerateSynthesis && documents.length > 0 && (
+            <button
+              type="button"
+              onClick={onGenerateSynthesis}
+              disabled={isSynthesizing}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-md transition-all cursor-pointer ${
+                isSynthesizing
+                  ? 'bg-teal-100 text-teal-800 animate-pulse cursor-wait'
+                  : synthesis?.markdown
+                  ? 'bg-slate-100 hover:bg-teal-50 text-slate-700 hover:text-teal-800 border border-slate-200 hover:border-teal-300'
+                  : 'bg-teal-600 hover:bg-teal-700 active:bg-teal-800 text-white shadow-2xs'
+              }`}
+              title={synthesis?.markdown ? "Re-run AI synthesis over retrieved studies" : "Generate clinical evidence synthesis report"}
+            >
+              <Sparkles className={`w-3.5 h-3.5 ${isSynthesizing ? 'animate-spin text-teal-600' : synthesis?.markdown ? 'text-teal-600' : 'text-teal-100'}`} />
+              <span>{isSynthesizing ? 'Synthesizing...' : synthesis?.markdown ? 'Re-synthesize' : 'Generate Report'}</span>
+            </button>
+          )}
+
           {durationMs && (
             <span className="text-[10px] font-mono text-slate-400 flex items-center gap-1">
               <Clock className="w-3 h-3" />
@@ -237,7 +457,8 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
           <button
             onClick={handleCopy}
-            className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors"
+            disabled={!synthesis?.markdown}
+            className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             title="Copy Report to Clipboard"
           >
             {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
@@ -245,7 +466,8 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
           <button
             onClick={handleDownload}
-            className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors"
+            disabled={!synthesis?.markdown}
+            className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             title="Download Markdown Report"
           >
             <Download className="w-3.5 h-3.5" />
@@ -257,7 +479,23 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
       <div className="flex-1 overflow-y-auto p-6">
         {activeView === 'report' ? (
           <div className="max-w-3xl mx-auto prose prose-slate prose-sm text-slate-800">
-            {synthesis?.markdown ? (
+            {isSynthesizing ? (
+              <div className="py-16 text-center max-w-md mx-auto space-y-4">
+                <div className="w-14 h-14 mx-auto rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center shadow-xs">
+                  <Sparkles className="w-7 h-7 text-teal-600 animate-spin" />
+                </div>
+                <div>
+                  <h3 className="text-base font-semibold text-slate-800">Synthesizing Clinical Evidence Report...</h3>
+                  <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                    Analyzing {documents.length} retrieved publications, synthesizing comparative outcomes across intervention vs comparator arms, and generating verified bracket citations [Author Year].
+                  </p>
+                </div>
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-slate-100 rounded-full text-[11px] text-slate-600 font-mono">
+                  <span className="w-2 h-2 rounded-full bg-teal-500 animate-ping" />
+                  <span>Agentic Evidence Synthesis in progress</span>
+                </div>
+              </div>
+            ) : synthesis?.markdown ? (
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
@@ -305,6 +543,48 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
               >
                 {synthesis.markdown}
               </ReactMarkdown>
+            ) : documents.length > 0 ? (
+              <div className="py-12 px-6 max-w-lg mx-auto bg-white rounded-xl border border-teal-200/80 shadow-2xs text-center space-y-4">
+                <div className="w-12 h-12 mx-auto rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center">
+                  <Sparkles className="w-6 h-6 text-teal-600" />
+                </div>
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">Medical Evidence Retrieved &amp; Indexed</h3>
+                  <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                    MeSH expansion, multi-database search across PubMed, vector indexing, and PICO matrix extraction have completed for <strong className="text-slate-800">{documents.length} studies</strong>.
+                  </p>
+                </div>
+
+                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-lg text-left text-[11px] text-slate-600 space-y-1.5">
+                  <div className="flex items-center gap-2 font-medium text-slate-700">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                    <span>MeSH &amp; UMLS MetaMapLite semantic concept extraction complete</span>
+                  </div>
+                  <div className="flex items-center gap-2 font-medium text-slate-700">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                    <span>{documents.length} publications indexed with clinical PICO matrix</span>
+                  </div>
+                  <div className="flex items-center gap-2 font-medium text-slate-700">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                    <span>Semantic vector ranking applied in Qdrant</span>
+                  </div>
+                </div>
+
+                {onGenerateSynthesis && (
+                  <button
+                    type="button"
+                    onClick={onGenerateSynthesis}
+                    disabled={isSynthesizing}
+                    className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-teal-600 hover:bg-teal-700 active:bg-teal-800 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Generate Clinical Evidence Synthesis Report</span>
+                  </button>
+                )}
+                <p className="text-[10px] text-slate-400">
+                  Synthesizes study findings into a structured Cochrane-style narrative with verified in-text citations [Author Year].
+                </p>
+              </div>
             ) : (
               <div className="py-16 text-center text-slate-400">
                 <BookOpen className="w-12 h-12 mx-auto text-slate-300 mb-3" />

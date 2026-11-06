@@ -653,49 +653,74 @@ export const RightContext: React.FC<RightContextProps> = ({
               </div>
             </div>
 
-            {/* 3. Rolling Storage (FIFO Capacity Management) */}
+            {/* 3. Rolling Storage (Dynamic 4 GB Physical Capacity Management) */}
             <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3 shadow-2xs">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <HardDrive className="w-4 h-4 text-teal-600" />
-                  <h4 className="font-semibold text-slate-800">Rolling Storage (FIFO Capacity Management)</h4>
+                  <h4 className="font-semibold text-slate-800">Rolling Storage &amp; Dynamic Capacity</h4>
                 </div>
                 <span className="text-[10px] font-mono px-2 py-0.5 bg-teal-50 text-teal-700 border border-teal-200 rounded font-semibold">
-                  Buffer Active
+                  {vectorStatus?.activeBackend === 'qdrant' ? '4 GB Free Tier' : 'In-Memory Buffer'}
                 </span>
               </div>
 
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-[11px]">
-                  <span className="text-slate-600 font-medium">Database Vector Capacity:</span>
-                  <span className="font-mono font-semibold text-slate-800">
-                    {(vectorStatus?.totalIndexed || documents.length).toLocaleString()} / {(vectorStatus?.maxCapacity || (vectorStatus?.activeBackend === 'qdrant' ? 200000 : 2000)).toLocaleString()} vectors ({vectorStatus?.storageUsagePct || 1}% used)
-                  </span>
+              {vectorStatus?.activeBackend === 'qdrant' ? (
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600 font-medium">Qdrant Storage (4 GB Free Tier Quota):</span>
+                    <span className="font-mono font-semibold text-slate-800">
+                      {vectorStatus.usedStorageMb ?? 0} MB / {vectorStatus.storageAllocationMb ?? 4096} MB ({vectorStatus.storageUsagePct ?? 0}% used)
+                    </span>
+                  </div>
+                  <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.max(1, Math.min(100, vectorStatus.storageUsagePct ?? 1))}%` }}
+                    />
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 pt-1 text-[10px]">
+                    <div className="bg-slate-50 p-1.5 rounded border border-slate-100">
+                      <span className="text-slate-400 block text-[9px] uppercase font-semibold">Free Storage</span>
+                      <span className="font-mono font-bold text-slate-700">{vectorStatus.freeStorageMb ?? 4096} MB</span>
+                    </div>
+                    <div className="bg-slate-50 p-1.5 rounded border border-slate-100">
+                      <span className="text-slate-400 block text-[9px] uppercase font-semibold">Indexed Vectors</span>
+                      <span className="font-mono font-bold text-slate-700">{(vectorStatus.totalIndexed || documents.length).toLocaleString()}</span>
+                    </div>
+                    <div className="bg-slate-50 p-1.5 rounded border border-slate-100">
+                      <span className="text-slate-400 block text-[9px] uppercase font-semibold">Rollover Limit</span>
+                      <span className="font-mono font-bold text-teal-700">85% (~{vectorStatus.rolloverThresholdMb ?? 3482} MB)</span>
+                    </div>
+                  </div>
                 </div>
-                <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 rounded-full transition-all duration-500"
-                    style={{ width: `${Math.max(2, Math.min(100, vectorStatus?.storageUsagePct || 1))}%` }}
-                  />
+              ) : (
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-600 font-medium">In-Memory Heap Buffer:</span>
+                    <span className="font-mono font-semibold text-slate-800">
+                      {(vectorStatus?.totalIndexed || documents.length).toLocaleString()} / {(vectorStatus?.maxCapacity || 2000).toLocaleString()} vectors ({vectorStatus?.storageUsagePct || 1}% used)
+                    </span>
+                  </div>
+                  <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.max(2, Math.min(100, vectorStatus?.storageUsagePct || 1))}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="flex justify-between items-center text-[10px] text-slate-500 pt-0.5">
-                  <span>Backend: <strong className="text-slate-700">{vectorStatus?.activeBackend === 'qdrant' ? 'Qdrant Dedicated Engine' : 'Node.js In-Memory Store'}</strong></span>
-                  <span className="font-mono text-[9px] bg-slate-100 px-1.5 py-0.5 rounded text-slate-600 font-medium">
-                    Limit: {vectorStatus?.activeBackend === 'qdrant' ? '200,000 (or on overlimit)' : '2,000 (rolling FIFO)'}
-                  </span>
-                </div>
-              </div>
+              )}
 
               <div className="bg-slate-50 p-2.5 rounded border border-slate-200/80 text-[11px] text-slate-600 space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <span className="font-medium text-slate-700">Rolling Storage Mechanism:</span>
-                  <span className="text-teal-700 font-semibold font-mono text-[10px]">FIFO Auto-Pruning</span>
+                  <span className="font-medium text-slate-700">Dynamic Storage Management:</span>
+                  <span className="text-teal-700 font-semibold font-mono text-[10px]">Physical Space FIFO</span>
                 </div>
                 <p className="text-[10px] text-slate-500 leading-relaxed">
-                  When vector storage reaches maximum capacity (<strong>200,000 vectors</strong> for Qdrant, or <strong>2,000 vectors</strong> for local in-memory) or if Qdrant reports an <em>overlimit</em> condition, the database automatically removes the oldest indexed records (sorted by <code className="text-teal-700 bg-white px-1 rounded border border-slate-200">indexedAt</code> timestamp) before inserting new studies. Memory and disk boundaries are strictly preserved with zero overflow.
+                  Qdrant Cloud Free Tier provides <strong>4 GB of physical storage</strong>. Storage consumption dynamically models dense float vectors, HNSW indexing graphs, and full clinical PICO JSON metadata payloads. Rather than enforcing an arbitrary static vector count, the system continuously tracks physical bytes: when storage hits the <strong>85% safety threshold (~3,481 MB)</strong> or reports an overlimit condition, FIFO rollover automatically evicts the oldest indexed studies (by <code className="text-teal-700 bg-white px-1 rounded border border-slate-200">indexedAt</code>) to maintain headroom.
                 </p>
                 <div className="pt-1.5 border-t border-slate-200/70 flex items-center justify-between text-[10px] text-slate-500">
-                  <span>Oldest Records Pruned by Rolling Buffer:</span>
+                  <span>Oldest Records Pruned by Buffer:</span>
                   <span className="font-mono font-bold text-slate-800">{vectorStatus?.totalEvicted || 0} studies</span>
                 </div>
               </div>
@@ -708,14 +733,14 @@ export const RightContext: React.FC<RightContextProps> = ({
                 <h4 className="font-semibold text-slate-900">What if Qdrant is Not Running?</h4>
               </div>
               <p className="text-[11px] text-slate-600 leading-relaxed">
-                <strong>Where are vector details stored if Qdrant is offline?</strong> When the Qdrant container is stopped or port 6333 is unreachable, the system automatically activates the <strong>Engineered In-Memory Vector Engine (<code className="text-blue-700 bg-white px-1 rounded border border-blue-200">local_in_memory</code>)</strong>:
+                <strong>Where are vector details stored if Qdrant is offline?</strong> When the Qdrant instance is stopped or unreachable, the system gracefully fails over to the <strong>Engineered In-Memory Vector Engine (<code className="text-blue-700 bg-white px-1 rounded border border-blue-200">local_in_memory</code>)</strong>:
               </p>
               <ul className="list-disc pl-5 text-[11px] text-slate-600 space-y-1 leading-relaxed">
                 <li>
                   <strong>Node.js Dense Vector Space:</strong> Embeddings are stored in normalized <code className="text-blue-700 bg-white px-1 rounded border border-blue-200">Float64Array</code> memory vectors with high-precision Cosine Similarity ranking.
                 </li>
                 <li>
-                  <strong>FIFO Rolling Storage:</strong> The in-memory buffer enforces a 2,000-vector rolling capacity to protect Node.js heap memory, while Qdrant scales up to 200,000 vectors with automatic eviction on overlimit.
+                  <strong>Dynamic Free Tier Rollover:</strong> The in-memory buffer enforces a 2,000-vector buffer to protect Node.js heap memory, while Qdrant operates on its 4 GB Free Tier quota with dynamic space tracking and 85% threshold rollover.
                 </li>
                 <li>
                   <strong>Client-Side Session Cache:</strong> Browser state and storage cache active study datasets and PICO matrices, ensuring continuous uninterrupted research across searches.

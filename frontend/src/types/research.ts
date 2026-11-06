@@ -28,6 +28,45 @@ export interface MedicalDocument {
   score?: number;
 }
 
+export interface MetaMapLiteConcept {
+  cui: string;
+  matchedText: string;
+  preferredName: string;
+  semanticTypes: string[];
+  semanticTypeNames: string[];
+  meshId?: string;
+  meshDescriptor?: string;
+  meshUri?: string;
+  score: number;
+  pos?: [number, number];
+  sourceVocabularies: string[];
+}
+
+export interface MetaMapComparativeArm {
+  name: string;
+  expanded: string;
+  concepts: MetaMapLiteConcept[];
+  pubmedTerm: string;
+}
+
+export interface MetaMapLiteResult {
+  query: string;
+  concepts: MetaMapLiteConcept[];
+  meshHeadings: string[];
+  umlsConcepts: string[];
+  semanticTypesSummary: string[];
+  optimizedPubMedQuery: string;
+  booleanQuery: string;
+  isComparative: boolean;
+  comparativeDetails?: {
+    arm1: MetaMapComparativeArm;
+    arm2: MetaMapComparativeArm;
+    contextCondition?: string;
+  };
+  provenance: string;
+  timestamp: string;
+}
+
 export interface QueryExpansion {
   originalQuery: string;
   expandedQuery: string;
@@ -36,6 +75,7 @@ export interface QueryExpansion {
   booleanQuery: string;
   targetPopulation: string;
   targetIntervention: string;
+  metaMap?: MetaMapLiteResult;
 }
 
 export interface SynthesisData {
@@ -92,7 +132,14 @@ export interface VectorStatusInfo {
   maxCapacity: number;
   localMaxCapacity?: number;
   qdrantMaxCapacity?: number;
+  isQdrantFreeTier?: boolean;
+  storageAllocationGb?: number;
+  storageAllocationMb?: number;
+  usedStorageMb?: number;
+  freeStorageMb?: number;
   storageUsagePct: number;
+  rolloverThresholdPct?: number;
+  rolloverThresholdMb?: number;
   rollingBufferActive: boolean;
   totalEvicted: number;
   oldestRecordDate?: string;

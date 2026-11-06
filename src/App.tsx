@@ -124,6 +124,32 @@ export default function App() {
     }
   };
 
+  const [isSynthesizing, setIsSynthesizing] = useState(false);
+
+  const handleGenerateSynthesis = async () => {
+    if (!query.trim() || isSynthesizing || documents.length === 0) return;
+    setIsSynthesizing(true);
+    try {
+      const res = await fetch('/api/synthesize-report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, documents: documents.slice(0, 30) })
+      });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (data.synthesis) {
+        setSynthesis(data.synthesis);
+      }
+    } catch (err) {
+      console.error('[App] Clinical report synthesis failed:', err);
+      setErrorMsg(err instanceof Error ? err.message : 'Clinical synthesis failed.');
+    } finally {
+      setIsSynthesizing(false);
+    }
+  };
+
   const handleLoadMore = async () => {
     if (isLoadingMore || !hasMore || !query.trim()) return;
     setIsLoadingMore(true);
@@ -131,7 +157,7 @@ export default function App() {
       const res = await fetch('/api/search-and-index/load-more', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, offset: nextOffset, batchSize: 25, filters })
+        body: JSON.stringify({ query, offset: nextOffset, batchSize: 40, filters })
       });
       if (res.ok) {
         const data = await res.json();
@@ -322,6 +348,8 @@ export default function App() {
                 documents={filteredDocuments}
                 onSelectCitation={handleSelectCitation}
                 durationMs={durationMs}
+                onGenerateSynthesis={handleGenerateSynthesis}
+                isSynthesizing={isSynthesizing}
               />
             </div>
 

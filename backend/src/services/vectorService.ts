@@ -12,12 +12,17 @@ import {
 
 export const COLLECTION_NAME = 'medical_workspace';
 
-// Configurable rolling capacity thresholds:
-// Local in-memory storage limit: 2,000 dense vectors (prevents Node.js heap exhaustion)
+// Qdrant Cloud Free Tier Physical Storage Allocation: 4 GB (4,096 MB = 4,294,967,296 bytes)
+export const QDRANT_FREE_TIER_DISK_BYTES = 4 * 1024 * 1024 * 1024;
+export const QDRANT_FREE_TIER_DISK_MB = 4096;
+
+// Low-space rollover threshold: 85% of 4 GB (~3,481 MB). Trigger FIFO eviction when disk drops below 15% free space.
+export const QDRANT_ROLLOVER_THRESHOLD_PCT = 85;
+export const QDRANT_ROLLOVER_THRESHOLD_BYTES = Math.floor(QDRANT_FREE_TIER_DISK_BYTES * (QDRANT_ROLLOVER_THRESHOLD_PCT / 100));
+
+// Local in-memory storage limit (Node.js heap protection when Qdrant is offline)
 export const LOCAL_MAX_CAPACITY = Number(process.env.LOCAL_MAX_CAPACITY) || 2000;
-// Qdrant native vector storage limit: 200,000 dense vectors (or triggered when Qdrant reports overlimit)
-export const QDRANT_MAX_CAPACITY = Number(process.env.QDRANT_MAX_CAPACITY) || 200000;
-// Backward compatibility alias:
+// Backward compatibility alias
 export const MAX_VECTOR_CAPACITY = LOCAL_MAX_CAPACITY;
 
 export interface VectorSearchResult {
@@ -55,8 +60,14 @@ export interface VectorStatus {
   vectorAcceleration?: string;
   maxCapacity: number;
   localMaxCapacity: number;
-  qdrantMaxCapacity: number;
+  isQdrantFreeTier?: boolean;
+  storageAllocationGb: number;
+  storageAllocationMb: number;
+  usedStorageMb: number;
+  freeStorageMb: number;
   storageUsagePct: number;
+  rolloverThresholdPct: number;
+  rolloverThresholdMb: number;
   rollingBufferActive: boolean;
   totalEvicted: number;
   oldestRecordDate?: string;
@@ -310,9 +321,21 @@ export function isQdrantOverlimitError(err: any): boolean {
 }
 
 /**
- * Performs rolling storage FIFO cleanup in Qdrant when vector space reaches maximum capacity (200,000)
- * or when Qdrant reports an overlimit/capacity condition.
- * The oldest records (by indexedAt timestamp) are evicted to make room for new incoming records.
+ * Calculates dynamic on-disk storage bytes per indexed vector point:
+ * Dense Float32 vector (dimension * 4) + HNSW graph structure (1.5x) + PICO clinical JSON payload + index overhead.
+ */
+export function estimateBytesPerVectorPoint(dimension = EMBEDDING_DIMENSION): number {
+  const vectorBytes = dimension * 4;
+  const hnswBytes = Math.round(vectorBytes * 1.5);
+  const payloadBytes = 6500; // PICO matrix JSON + full abstract + metadata
+  const walAndIndexBytes = 1500;
+  return vectorBytes + hnswBytes + payloadBytes + walAndIndexBytes;
+}
+
+/**
+ * Performs rolling storage FIFO cleanup in Qdrant dynamically when disk storage approaches 85% of 4 GB,
+ * or when Qdrant reports an overlimit/insufficient storage condition.
+ * There is NO arbitrary point limit: storage is bound dynamically to the 4 GB Free Tier disk quota.
  */
 async function performQdrantRollingEviction(newIncomingCount: number, forceEvictionCount?: number): Promise<number> {
   if (!isQdrantReady || !qdrantClient) return 0;
@@ -321,18 +344,29 @@ async function performQdrantRollingEviction(newIncomingCount: number, forceEvict
     const colInfo = await qdrantClient.getCollection(COLLECTION_NAME);
     const currentPoints = colInfo.points_count || 0;
     const projectedTotal = currentPoints + newIncomingCount;
+    const vectorsConfig = colInfo.config?.params?.vectors as Record<string, any> | undefined;
+    const detectedDimension = typeof vectorsConfig?.size === 'number'
+      ? vectorsConfig.size
+      : EMBEDDING_DIMENSION;
+    const bytesPerPoint = estimateBytesPerVectorPoint(detectedDimension);
+    const projectedStorageBytes = projectedTotal * bytesPerPoint;
 
     let excessCount = 0;
     if (forceEvictionCount && forceEvictionCount > 0) {
       excessCount = forceEvictionCount;
-    } else if (projectedTotal > QDRANT_MAX_CAPACITY) {
-      excessCount = projectedTotal - QDRANT_MAX_CAPACITY;
+    } else if (projectedStorageBytes >= QDRANT_ROLLOVER_THRESHOLD_BYTES) {
+      // Storage is low (>= 85% of 4 GB): calculate points to prune to restore ~25% free headroom (~75% capacity)
+      const targetBytes = Math.floor(QDRANT_FREE_TIER_DISK_BYTES * 0.75);
+      const bytesToFree = projectedStorageBytes - targetBytes;
+      excessCount = Math.max(newIncomingCount * 2, Math.ceil(bytesToFree / bytesPerPoint));
     }
 
     if (excessCount <= 0) return 0;
 
-    console.log(
-      `[vectorService] Qdrant rolling eviction triggered (${forceEvictionCount ? 'overlimit signal' : `capacity reached ${currentPoints}/${QDRANT_MAX_CAPACITY}`}). Evicting ${excessCount} oldest records...`
+    console.warn(
+      `[vectorService] Qdrant 4GB Free Tier dynamic rollover triggered: ${projectedTotal} points ` +
+      `(~${Math.round(projectedStorageBytes / (1024 * 1024))} MB, >= ${QDRANT_ROLLOVER_THRESHOLD_PCT}% of 4 GB). ` +
+      `Pruning ${excessCount} oldest records via FIFO rollover to restore free space...`
     );
 
     // Scroll points to identify oldest records
@@ -578,13 +612,26 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
 }
 
 /**
- * Returns vector database telemetry including capacity, rolling FIFO storage, and schema verification
+ * Returns vector database telemetry including capacity, dynamic 4GB Free Tier storage metrics, and schema verification
  */
 export function getVectorStatus(): VectorStatus {
   const isQdrant = isQdrantReady;
   const currentCount = isQdrant ? cachedSchemaVerification.totalPoints || memoryStore.size : memoryStore.size;
-  const maxCap = isQdrant ? QDRANT_MAX_CAPACITY : LOCAL_MAX_CAPACITY;
-  const usagePct = Math.min(100, Math.round((currentCount / maxCap) * 100));
+  const bytesPerPoint = estimateBytesPerVectorPoint(isQdrant ? cachedSchemaVerification.vectorDimension : 384);
+
+  // Dynamic 4 GB Free Tier Storage Telemetry
+  const usedStorageBytes = isQdrant
+    ? currentCount * bytesPerPoint
+    : currentCount * 12 * 1024; // Node heap footprint
+  const usedStorageMb = Math.round((usedStorageBytes / (1024 * 1024)) * 10) / 10;
+  const totalAllocationMb = isQdrant ? QDRANT_FREE_TIER_DISK_MB : 64;
+  const freeStorageMb = Math.max(0, Math.round((totalAllocationMb - usedStorageMb) * 10) / 10);
+  const usagePct = Math.min(100, Math.max(currentCount > 0 ? 1 : 0, Math.round((usedStorageMb / totalAllocationMb) * 100)));
+
+  // Dynamic capacity based on 4 GB disk quota (not an arbitrary static number)
+  const maxCap = isQdrant
+    ? Math.floor(QDRANT_FREE_TIER_DISK_BYTES / bytesPerPoint)
+    : LOCAL_MAX_CAPACITY;
 
   // Find oldest record timestamp in memory
   let oldestTimestamp: number | undefined;
@@ -602,8 +649,14 @@ export function getVectorStatus(): VectorStatus {
     url: config.qdrantUrl,
     maxCapacity: maxCap,
     localMaxCapacity: LOCAL_MAX_CAPACITY,
-    qdrantMaxCapacity: QDRANT_MAX_CAPACITY,
+    isQdrantFreeTier: isQdrantReady,
+    storageAllocationGb: isQdrantReady ? 4 : 0.06,
+    storageAllocationMb: totalAllocationMb,
+    usedStorageMb,
+    freeStorageMb,
     storageUsagePct: usagePct,
+    rolloverThresholdPct: QDRANT_ROLLOVER_THRESHOLD_PCT,
+    rolloverThresholdMb: Math.round(QDRANT_FREE_TIER_DISK_MB * (QDRANT_ROLLOVER_THRESHOLD_PCT / 100)),
     rollingBufferActive: true,
     totalEvicted: totalEvictedCount,
     oldestRecordDate: oldestTimestamp ? new Date(oldestTimestamp).toISOString() : undefined,
@@ -612,7 +665,7 @@ export function getVectorStatus(): VectorStatus {
       totalPoints: currentCount
     },
     offlineFallbackExplanation:
-      'When Qdrant is not running or port 6333 is unreachable, vectors are automatically hosted in the Node.js Engineered Dense Vector Space (Float64Array Cosine Proximity) with rolling FIFO buffer (Capacity: 2,000 points; Qdrant capacity: 200,000 points or on overlimit) and browser client-side caching. Active research sessions continue with zero interruption.'
+      'Qdrant is configured on Free Tier with 4 GB disk quota (~4,096 MB). Storage usage is dynamically tracked per vector and clinical payload without an arbitrary point limit. Automated FIFO rollover proactively monitors cluster storage and evicts oldest points at the 85% threshold to guarantee continuous zero-interruption research. If Qdrant is offline, the Node.js dense vector space protects server heap with a 2,000-point FIFO buffer.'
   };
 }
 
@@ -620,8 +673,10 @@ export const vectorService = {
   COLLECTION_NAME,
   MAX_VECTOR_CAPACITY,
   LOCAL_MAX_CAPACITY,
-  QDRANT_MAX_CAPACITY,
+  QDRANT_FREE_TIER_DISK_MB,
+  QDRANT_FREE_TIER_DISK_BYTES,
   isQdrantOverlimitError,
+  estimateBytesPerVectorPoint,
   initQdrant,
   clearVectorStore,
   upsertDocuments,

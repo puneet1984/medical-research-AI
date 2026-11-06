@@ -1,5 +1,6 @@
 import { executeInference } from '../services/openRouterService.js';
 import { config } from '../config.js';
+import { extractMetaMapLiteConcepts, MetaMapLiteResult } from '../services/metaMapLiteService.js';
 
 export interface QueryExpansionResult {
   originalQuery: string;
@@ -9,102 +10,118 @@ export interface QueryExpansionResult {
   booleanQuery: string;
   targetPopulation: string;
   targetIntervention: string;
+  metaMap?: MetaMapLiteResult;
 }
 
 /**
- * Fallback heuristic expansion when inference is offline
+ * Dynamically normalizes user queries containing comparison operators (vs, versus, v., compared with)
+ * to proper boolean syntax without any hardcoded dictionary.
  */
-function heuristicExpand(query: string): QueryExpansionResult {
-  const qLower = query.toLowerCase();
-  const mesh: string[] = [];
-  const umls: string[] = [];
+export function normalizeComparativeQuery(query: string): { primaryQuery: string; booleanQuery: string; keywords: string[] } {
+  const qClean = query.trim();
+  const parts = qClean.split(/\s+(?:vs\.?|versus|compared\s+with|and)\s+/i).map(p => p.trim()).filter(Boolean);
 
-  if (qLower.includes('heart failure') || qLower.includes('hfpef') || qLower.includes('hfref')) {
-    mesh.push('Heart Failure [MeSH]', 'Heart Failure, Diastolic [MeSH]', 'Ventricular Function, Left [MeSH]');
-    umls.push('C0018801 (Heart Failure)', 'C0264906 (Diastolic Heart Failure)');
+  if (parts.length >= 2) {
+    const item1 = parts[0];
+    const item2 = parts[1];
+    const primaryQuery = `${item1} AND ${item2}`;
+    const booleanQuery = `(${item1}) AND (${item2})`;
+    return {
+      primaryQuery,
+      booleanQuery,
+      keywords: [item1.toLowerCase(), item2.toLowerCase()]
+    };
   }
-  if (qLower.includes('sglt2') || qLower.includes('dapagliflozin') || qLower.includes('empagliflozin')) {
-    mesh.push('Sodium-Glucose Transporter 2 Inhibitors [MeSH]', 'Dapagliflozin [Supplementary Concept]');
-    umls.push('C3886847 (SGLT-2 Inhibitor)');
-  }
-  if (qLower.includes('obesity') || qLower.includes('weight') || qLower.includes('glp-1') || qLower.includes('semaglutide') || qLower.includes('tirzepatide')) {
-    mesh.push('Obesity [MeSH]', 'Glucagon-Like Peptide-1 Receptor Agonists [MeSH]', 'Weight Loss [MeSH]');
-    umls.push('C0028754 (Obesity)', 'C2982845 (GLP-1 Agonist)');
-  }
-  if (qLower.includes('cancer') || qLower.includes('pembrolizumab') || qLower.includes('oncology') || qLower.includes('chemo')) {
-    mesh.push('Neoplasms [MeSH]', 'Antineoplastic Agents, Immunological [MeSH]', 'Programmed Cell Death 1 Receptor [MeSH]');
-    umls.push('C0006826 (Malignant Neoplasms)', 'C3886518 (Pembrolizumab)');
-  }
-
-  if (mesh.length === 0) {
-    mesh.push(`${query} [MeSH]`, 'Therapeutics [MeSH]', 'Randomized Controlled Trial [Publication Type]');
-    umls.push(`UMLS-Concept (${query})`);
-  }
-
-  const booleanQuery = `("${query}" OR "${mesh[0]?.split(' [')[0] || query}") AND (randomized controlled trial[Filter] OR clinical trial[Filter])`;
 
   return {
-    originalQuery: query,
-    expandedQuery: `${query} randomized controlled trial clinical outcomes`,
-    meshTerms: mesh,
-    umlsConcepts: umls,
-    booleanQuery,
-    targetPopulation: 'Adult clinical population matching study criteria',
-    targetIntervention: query
+    primaryQuery: qClean,
+    booleanQuery: qClean,
+    keywords: qClean.toLowerCase().split(/\s+/).filter(w => w.length > 2)
   };
 }
 
 /**
- * Query Agent: Expands user query into technical MeSH/UMLS semantic terms
+ * Query Agent: 100% Dynamic API-driven query expansion.
+ * Calls MetaMapLite concept extraction (LLM semantic decomposition + NLM MeSH RDF API id.nlm.nih.gov)
+ * to retrieve real MeSH terms, UMLS concepts, and clinical parameters dynamically.
+ * Zero hardcoded lists.
  */
 export async function expandQuery(query: string): Promise<QueryExpansionResult> {
-  const prompt = `You are a clinical biomedical informatics query agent. Expand this user clinical query into formal MeSH/UMLS ontology terms and a search string:
+  const normalized = normalizeComparativeQuery(query);
 
-QUERY: "${query}"
-
-Return valid JSON with these exact keys:
-{
-  "originalQuery": "${query}",
-  "expandedQuery": "concise query enriched with clinical synonyms",
-  "meshTerms": ["Term 1 [MeSH]", "Term 2 [MeSH]"],
-  "umlsConcepts": ["CUI (Concept name)", "CUI (Concept name)"],
-  "booleanQuery": "formal boolean search query with AND/OR and parentheses",
-  "targetPopulation": "clinical patient cohort",
-  "targetIntervention": "primary drug or therapy"
-}
-
-Provide ONLY raw JSON without markdown or code blocks.`;
-
+  // 1. Run dynamic NLM MetaMapLite concept extraction & live MeSH RDF API lookups
+  let metaMapResult: MetaMapLiteResult | undefined;
   try {
-    const { text } = await executeInference(prompt, {
-      model: config.llmReasoningModel,
-      temperature: 0.1,
-      maxTokens: 800,
-      systemPrompt: 'You are a biomedical terminology expert specializing in MeSH, UMLS, and clinical query expansion. Return only valid JSON.'
-    });
-
-    if (text) {
-      const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.expandedQuery && Array.isArray(parsed.meshTerms)) {
-        return {
-          originalQuery: query,
-          expandedQuery: parsed.expandedQuery,
-          meshTerms: parsed.meshTerms,
-          umlsConcepts: parsed.umlsConcepts || [],
-          booleanQuery: parsed.booleanQuery || `${query} AND clinical trial`,
-          targetPopulation: parsed.targetPopulation || 'Clinical cohort',
-          targetIntervention: parsed.targetIntervention || query
-        };
-      }
-    }
+    metaMapResult = await extractMetaMapLiteConcepts(query);
   } catch (err) {
-    console.warn('[queryAgent] Inference expansion encountered note, using deterministic biomedical expansion:', err instanceof Error ? err.message : err);
+    console.warn('[queryAgent] Dynamic MetaMapLite extraction notice:', err instanceof Error ? err.message : err);
   }
 
-  return heuristicExpand(query);
+  // 2. Synthesize MeSH and UMLS concepts from dynamic API responses
+  const meshTerms = metaMapResult?.meshHeadings && metaMapResult.meshHeadings.length > 0
+    ? metaMapResult.meshHeadings
+    : ['Therapeutics [MeSH]'];
+
+  const umlsConcepts = metaMapResult?.umlsConcepts && metaMapResult.umlsConcepts.length > 0
+    ? metaMapResult.umlsConcepts
+    : [`UMLS-Concept (${query})`];
+
+  const booleanQuery = metaMapResult?.booleanQuery || normalized.booleanQuery;
+  const expandedQuery = metaMapResult?.optimizedPubMedQuery || normalized.booleanQuery;
+
+  // 3. Dynamic clinical cohort & intervention extraction via LLM Inference API
+  let targetPopulation = 'Adult clinical patient cohort meeting inclusion criteria';
+  let targetIntervention = query;
+
+  if (Boolean(config.openRouterApiKey) || Boolean(config.geminiApiKey) || Boolean(process.env.GEMINI_API_KEY)) {
+    const prompt = `You are a clinical biomedical informatics query agent. Review this clinical research query and dynamically extracted NLM MeSH concepts:
+QUERY: "${query}"
+MAPPED CONCEPTS: ${umlsConcepts.join(', ')}
+
+Identify target population and intervention dynamically. Return valid JSON with these keys:
+{
+  "targetPopulation": "clinical cohort description",
+  "targetIntervention": "primary surgical device, pharmaceutical therapy, or clinical intervention"
+}
+Provide ONLY raw JSON without markdown.`;
+
+    try {
+      const { text } = await executeInference(prompt, {
+        model: config.llmReasoningModel,
+        temperature: 0.1,
+        maxTokens: 300,
+        systemPrompt: 'You are an evidence-based medicine informatics specialist. Return valid JSON.'
+      });
+
+      if (text) {
+        const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(cleaned);
+        if (parsed.targetPopulation) targetPopulation = parsed.targetPopulation;
+        if (parsed.targetIntervention) targetIntervention = parsed.targetIntervention;
+      }
+    } catch (llmErr) {
+      console.warn('[queryAgent] LLM reasoning notice:', llmErr instanceof Error ? llmErr.message : llmErr);
+    }
+  }
+
+  // Derive dynamic intervention from comparative arms if available
+  if (metaMapResult?.comparativeDetails) {
+    targetIntervention = `${metaMapResult.comparativeDetails.arm1.expanded} vs ${metaMapResult.comparativeDetails.arm2.expanded}`;
+  }
+
+  return {
+    originalQuery: query,
+    expandedQuery,
+    meshTerms,
+    umlsConcepts,
+    booleanQuery,
+    targetPopulation,
+    targetIntervention,
+    metaMap: metaMapResult
+  };
 }
 
 export const queryAgent = {
-  expandQuery
+  expandQuery,
+  normalizeComparativeQuery
 };

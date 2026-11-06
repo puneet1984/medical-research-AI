@@ -1,6 +1,11 @@
 import { Request, Response } from 'express';
 import { expandQuery } from '../agents/queryAgent.js';
-import { searchAllAvailableStudies, searchMedicalLiterature, MedicalDocument } from '../services/searchService.js';
+import {
+  searchAllAvailableStudies,
+  searchMedicalLiterature,
+  filterAndRankByClinicalRelevance,
+  MedicalDocument
+} from '../services/searchService.js';
 import { upsertDocuments, searchSimilar, findCachedSimilar, getVectorStatus, initQdrant } from '../services/vectorService.js';
 import { synthesizeLiterature } from '../agents/synthesisAgent.js';
 
@@ -14,7 +19,7 @@ const sessionStudyRegistry = new Map<string, SessionQueryStudies>();
 export async function handleSearchAndIndex(req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
   try {
-    const { query, filters, limit = 28 } = req.body;
+    const { query, filters, limit = 40 } = req.body;
 
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       res.status(400).json({ error: 'Query string is required' });
@@ -22,20 +27,21 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     }
 
     const trimmedQuery = query.trim();
-    const searchLimit = Math.max(15, Math.min(Number(limit) || 28, 30));
+    const searchLimit = Math.max(15, Number(limit) || 40);
 
-    // 0. Vector Cache Check: Rapid pre-indexed vector lookup for repeat or similar topics
-    const cachedVectorHits = await findCachedSimilar(trimmedQuery, 0.45, searchLimit);
+    // 0. Vector Cache Check: Rapid pre-indexed vector lookup with high similarity threshold (0.78)
+    const rawCachedHits = await findCachedSimilar(trimmedQuery, 0.78, searchLimit);
+    const cachedVectorHits = filterAndRankByClinicalRelevance(rawCachedHits.map(c => c.document), trimmedQuery);
 
-    // 1. Agentic Step 1: Query Expansion (MeSH & UMLS)
+    // 1. Agentic Step 1: Dynamic Query Expansion (NLM MetaMap & LLM)
     const expansion = await expandQuery(trimmedQuery);
 
-    // 2. Agentic Step 2: Multi-Database Bulk Retrieval (Retrieve all available studies, e.g. 70-120 studies)
-    const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(expansion.expandedQuery || trimmedQuery, 120);
+    // 2. Agentic Step 2: Multi-Database Bulk Retrieval across PubMed, OpenAlex, Crossref, DOAJ
+    const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(trimmedQuery, 160, 0);
 
     // Combine cached vector studies with live fetched documents, deduplicating by DOI/PMID/Title
     const seenMap = new Map<string, MedicalDocument>();
-    for (const doc of [...cachedVectorHits.map(c => c.document), ...rawDocuments]) {
+    for (const doc of [...cachedVectorHits, ...rawDocuments]) {
       const key = (doc.doi || doc.pmid || doc.title).toLowerCase().trim();
       if (!seenMap.has(key)) {
         seenMap.set(key, doc);
@@ -100,8 +106,10 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
       return (b.score || 0) - (a.score || 0);
     });
 
-    // 5. Agentic Step 5: Clinical PICO Synthesis with bracket citations
-    const synthesis = await synthesizeLiterature(trimmedQuery, finalDocuments);
+    // User-Requested Behavior: Do NOT autogenerate clinical report in the initial pipeline.
+    // Execute MeSH & UMLS query expansion, multi-database retrieval, and PICO data matrix extraction.
+    // The user triggers clinical report synthesis on-demand via the UI.
+    const synthesis = null;
 
     const durationMs = Date.now() - startTime;
 
@@ -140,7 +148,7 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
 export async function handleLoadMoreStudies(req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
   try {
-    const { query, offset = 0, batchSize = 25, filters } = req.body;
+    const { query, offset = 0, batchSize = 40, filters } = req.body;
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       res.status(400).json({ error: 'Query string is required' });
       return;
@@ -151,15 +159,52 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
 
     if (!session || !session.allStudies || session.allStudies.length === 0) {
       // Re-fetch pool if session expired
-      const { allStudies } = await searchAllAvailableStudies(query.trim(), 120);
+      const { allStudies } = await searchAllAvailableStudies(query.trim(), 160, 0);
       session = { query: query.trim(), allStudies, createdAt: Date.now() };
       sessionStudyRegistry.set(trimmedQuery, session);
     }
 
     const currentOffset = Math.max(0, Number(offset) || 0);
-    const size = Math.max(5, Math.min(Number(batchSize) || 25, 40));
+    const size = Math.max(10, Number(batchSize) || 40);
 
     let pool = session.allStudies;
+
+    // Check if remaining in pool is less than requested batch size
+    const remainingInPool = pool.length - currentOffset;
+    if (remainingInPool < size) {
+      // Dynamically fetch next batch of 40-80 studies from live scholarly APIs with offset!
+      try {
+        const fetchAmount = Math.max(60, size * 2);
+        console.log(`[researchController] Fetching next ${fetchAmount} studies from live scholarly APIs with offset ${currentOffset}...`);
+        const { allStudies: nextLiveStudies } = await searchAllAvailableStudies(query.trim(), fetchAmount, currentOffset);
+
+        if (nextLiveStudies && nextLiveStudies.length > 0) {
+          const existingKeySet = new Set(pool.map(d => (d.doi || d.pmid || d.title).toLowerCase().trim()));
+          const novelStudies: MedicalDocument[] = [];
+          for (const study of nextLiveStudies) {
+            const key = (study.doi || study.pmid || study.title).toLowerCase().trim();
+            if (!existingKeySet.has(key)) {
+              existingKeySet.add(key);
+              novelStudies.push(study);
+            }
+          }
+          if (novelStudies.length > 0) {
+            pool.push(...novelStudies);
+            // Re-sort recent to past
+            pool.sort((a, b) => {
+              if (b.year !== a.year) return b.year - a.year;
+              return (b.citationCount || 0) - (a.citationCount || 0);
+            });
+            session.allStudies = pool;
+            sessionStudyRegistry.set(trimmedQuery, session);
+            console.log(`[researchController] Added ${novelStudies.length} new studies to session pool. Total pool: ${pool.length}`);
+          }
+        }
+      } catch (liveFetchErr) {
+        console.warn('[researchController] Live fetch during pagination warning:', liveFetchErr);
+      }
+    }
+
     if (filters) {
       if (typeof filters.minSample === 'number' && filters.minSample > 0) {
         pool = pool.filter(d => (d.pico?.sampleSize || 0) >= filters.minSample);
@@ -187,7 +232,8 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
     });
 
     const newNextOffset = currentOffset + batch.length;
-    const hasMore = newNextOffset < pool.length;
+    // Allow more if pool has more OR if batch returned full size (live APIs can provide even more)
+    const hasMore = newNextOffset < pool.length || batch.length >= size;
 
     res.json({
       success: true,
@@ -244,6 +290,30 @@ export function handleHealth(_req: Request, res: Response): void {
     timestamp: new Date().toISOString(),
     service: 'MedResearch AI Engine'
   });
+}
+
+import { extractMetaMapLiteConcepts } from '../services/metaMapLiteService.js';
+
+export async function handleMetaMapExtract(req: Request, res: Response): Promise<void> {
+  try {
+    const { query } = req.body;
+    if (!query || typeof query !== 'string' || !query.trim()) {
+      res.status(400).json({ error: 'Query string is required' });
+      return;
+    }
+
+    const result = await extractMetaMapLiteConcepts(query.trim());
+    res.json({
+      success: true,
+      result
+    });
+  } catch (err) {
+    console.error('[researchController] MetaMapLite extraction error:', err);
+    res.status(500).json({
+      error: 'Failed to extract MetaMapLite concepts',
+      details: err instanceof Error ? err.message : String(err)
+    });
+  }
 }
 
 // -------------------------------------------------------------
@@ -416,11 +486,49 @@ export async function handleSectionAction(req: Request, res: Response): Promise<
   }
 }
 
+export async function handleSynthesizeReport(req: Request, res: Response): Promise<void> {
+  const startTime = Date.now();
+  try {
+    const { query, documents } = req.body;
+    if (!query || typeof query !== 'string' || !query.trim()) {
+      res.status(400).json({ error: 'Query string is required' });
+      return;
+    }
+
+    const trimmedQuery = query.trim();
+    const candidateDocs: MedicalDocument[] = Array.isArray(documents) && documents.length > 0
+      ? documents
+      : (sessionStudyRegistry.get(trimmedQuery.toLowerCase())?.allStudies?.slice(0, 30) || []);
+
+    if (candidateDocs.length === 0) {
+      res.status(400).json({ error: 'No clinical documents available to synthesize. Please search literature first.' });
+      return;
+    }
+
+    const synthesis = await synthesizeLiterature(trimmedQuery, candidateDocs);
+
+    res.json({
+      success: true,
+      query: trimmedQuery,
+      synthesis,
+      durationMs: Date.now() - startTime
+    });
+  } catch (err) {
+    console.error('[researchController] Clinical report synthesis error:', err);
+    res.status(500).json({
+      error: 'Failed to synthesize clinical report',
+      details: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+
 export const researchController = {
   handleSearchAndIndex,
+  handleSynthesizeReport,
   handleVectorSearch,
   handleVectorStatus,
   handleHealth,
+  handleMetaMapExtract,
   handleGetSettings,
   handleUpdateSettings,
   handleGetOpenRouterModels,
