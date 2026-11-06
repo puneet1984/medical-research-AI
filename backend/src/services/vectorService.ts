@@ -12,8 +12,13 @@ import {
 
 export const COLLECTION_NAME = 'medical_workspace';
 
-// Configurable rolling capacity threshold: default 2,000 dense vectors
-export const MAX_VECTOR_CAPACITY = Number(process.env.MAX_VECTOR_CAPACITY) || 2000;
+// Configurable rolling capacity thresholds:
+// Local in-memory storage limit: 2,000 dense vectors (prevents Node.js heap exhaustion)
+export const LOCAL_MAX_CAPACITY = Number(process.env.LOCAL_MAX_CAPACITY) || 2000;
+// Qdrant native vector storage limit: 200,000 dense vectors (or triggered when Qdrant reports overlimit)
+export const QDRANT_MAX_CAPACITY = Number(process.env.QDRANT_MAX_CAPACITY) || 200000;
+// Backward compatibility alias:
+export const MAX_VECTOR_CAPACITY = LOCAL_MAX_CAPACITY;
 
 export interface VectorSearchResult {
   document: MedicalDocument;
@@ -49,6 +54,8 @@ export interface VectorStatus {
   cachedVectorHits?: number;
   vectorAcceleration?: string;
   maxCapacity: number;
+  localMaxCapacity: number;
+  qdrantMaxCapacity: number;
   storageUsagePct: number;
   rollingBufferActive: boolean;
   totalEvicted: number;
@@ -278,10 +285,36 @@ function deterministicPointId(str: string): number {
 }
 
 /**
- * Performs rolling storage FIFO cleanup in Qdrant when vector space reaches maximum capacity.
+ * Checks if an error from Qdrant indicates overlimit, quota reached, payload too large, or disk/memory exhaustion.
+ */
+export function isQdrantOverlimitError(err: any): boolean {
+  if (!err) return false;
+  const msg = (err.message || (typeof err === 'string' ? err : JSON.stringify(err))).toLowerCase();
+  const status = err.status || err.statusCode || err.response?.status || (typeof err.get_status === 'function' ? err.get_status() : undefined);
+
+  return (
+    status === 413 || // Payload too large / storage limit
+    status === 429 || // Too many requests / quota
+    status === 507 || // Insufficient storage
+    msg.includes('overlimit') ||
+    msg.includes('over limit') ||
+    msg.includes('capacity') ||
+    msg.includes('quota') ||
+    msg.includes('storage full') ||
+    msg.includes('disk full') ||
+    msg.includes('out of memory') ||
+    msg.includes('limit reached') ||
+    msg.includes('limit exceeded') ||
+    msg.includes('insufficient storage')
+  );
+}
+
+/**
+ * Performs rolling storage FIFO cleanup in Qdrant when vector space reaches maximum capacity (200,000)
+ * or when Qdrant reports an overlimit/capacity condition.
  * The oldest records (by indexedAt timestamp) are evicted to make room for new incoming records.
  */
-async function performQdrantRollingEviction(newIncomingCount: number): Promise<number> {
+async function performQdrantRollingEviction(newIncomingCount: number, forceEvictionCount?: number): Promise<number> {
   if (!isQdrantReady || !qdrantClient) return 0;
 
   try {
@@ -289,35 +322,59 @@ async function performQdrantRollingEviction(newIncomingCount: number): Promise<n
     const currentPoints = colInfo.points_count || 0;
     const projectedTotal = currentPoints + newIncomingCount;
 
-    if (projectedTotal > MAX_VECTOR_CAPACITY) {
-      const excessCount = projectedTotal - MAX_VECTOR_CAPACITY;
-      console.log(`[vectorService] Qdrant capacity reached (${currentPoints}/${MAX_VECTOR_CAPACITY}). Evicting ${excessCount} oldest records...`);
+    let excessCount = 0;
+    if (forceEvictionCount && forceEvictionCount > 0) {
+      excessCount = forceEvictionCount;
+    } else if (projectedTotal > QDRANT_MAX_CAPACITY) {
+      excessCount = projectedTotal - QDRANT_MAX_CAPACITY;
+    }
 
-      // Scroll points to identify oldest records
-      const scrollRes = await (qdrantClient as any).scroll(COLLECTION_NAME, {
-        limit: Math.min(excessCount * 2, 200),
+    if (excessCount <= 0) return 0;
+
+    console.log(
+      `[vectorService] Qdrant rolling eviction triggered (${forceEvictionCount ? 'overlimit signal' : `capacity reached ${currentPoints}/${QDRANT_MAX_CAPACITY}`}). Evicting ${excessCount} oldest records...`
+    );
+
+    // Scroll points to identify oldest records
+    const fetchLimit = Math.min(Math.max(excessCount, 50), 500);
+    let scrollRes: any;
+    try {
+      scrollRes = await (qdrantClient as any).scroll(COLLECTION_NAME, {
+        limit: fetchLimit,
+        with_payload: true,
+        with_vector: false,
+        order_by: {
+          key: 'indexedAt',
+          direction: 'asc'
+        }
+      });
+    } catch {
+      scrollRes = await (qdrantClient as any).scroll(COLLECTION_NAME, {
+        limit: fetchLimit,
         with_payload: true,
         with_vector: false
       });
+    }
 
-      const points = scrollRes?.points || [];
-      // Sort by indexedAt ascending (oldest first)
-      points.sort((a: any, b: any) => {
-        const timeA = a.payload?.indexedAt || 0;
-        const timeB = b.payload?.indexedAt || 0;
-        return timeA - timeB;
+    const points = scrollRes?.points || [];
+    if (!points.length) return 0;
+
+    // Sort by indexedAt ascending (oldest first)
+    points.sort((a: any, b: any) => {
+      const timeA = a.payload?.indexedAt || 0;
+      const timeB = b.payload?.indexedAt || 0;
+      return timeA - timeB;
+    });
+
+    const idsToDelete = points.slice(0, Math.min(excessCount, points.length)).map((p: any) => p.id);
+    if (idsToDelete.length > 0) {
+      await qdrantClient.delete(COLLECTION_NAME, {
+        points: idsToDelete,
+        wait: true
       });
-
-      const idsToDelete = points.slice(0, excessCount).map((p: any) => p.id);
-      if (idsToDelete.length > 0) {
-        await qdrantClient.delete(COLLECTION_NAME, {
-          points: idsToDelete,
-          wait: true
-        });
-        totalEvictedCount += idsToDelete.length;
-        console.log(`[vectorService] Successfully evicted ${idsToDelete.length} oldest points from Qdrant via FIFO rolling storage.`);
-        return idsToDelete.length;
-      }
+      totalEvictedCount += idsToDelete.length;
+      console.log(`[vectorService] Successfully evicted ${idsToDelete.length} oldest points from Qdrant via FIFO rolling storage.`);
+      return idsToDelete.length;
     }
   } catch (err) {
     console.warn('[vectorService] Rolling eviction check encountered notice:', err);
@@ -326,13 +383,13 @@ async function performQdrantRollingEviction(newIncomingCount: number): Promise<n
 }
 
 /**
- * Performs rolling storage FIFO cleanup on the in-memory fallback store
+ * Performs rolling storage FIFO cleanup on the in-memory fallback store (Limit: 2,000 vectors)
  */
 function performMemoryRollingEviction(newIncomingCount: number): number {
   const projectedTotal = memoryStore.size + newIncomingCount;
-  if (projectedTotal > MAX_VECTOR_CAPACITY) {
-    const excessCount = projectedTotal - MAX_VECTOR_CAPACITY;
-    console.log(`[vectorService] In-memory vector capacity reached (${memoryStore.size}/${MAX_VECTOR_CAPACITY}). Evicting ${excessCount} oldest records...`);
+  if (projectedTotal > LOCAL_MAX_CAPACITY) {
+    const excessCount = projectedTotal - LOCAL_MAX_CAPACITY;
+    console.log(`[vectorService] In-memory vector capacity reached (${memoryStore.size}/${LOCAL_MAX_CAPACITY}). Evicting ${excessCount} oldest records...`);
 
     // Sort existing keys by indexedAt ascending
     const entries = Array.from(memoryStore.entries());
@@ -416,7 +473,22 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
         points: pointsToUpsert
       });
       return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
-    } catch (err) {
+    } catch (err: any) {
+      if (isQdrantOverlimitError(err)) {
+        console.warn(`[vectorService] Qdrant reported OVERLIMIT condition (${err?.message || err}). Triggering emergency rolling FIFO eviction of oldest records...`);
+        const emergencyEvicted = await performQdrantRollingEviction(docs.length, Math.max(docs.length * 2, 50));
+        evictedCount += emergencyEvicted;
+        try {
+          await qdrantClient.upsert(COLLECTION_NAME, {
+            wait: true,
+            points: pointsToUpsert
+          });
+          console.log(`[vectorService] Successfully recovered: Qdrant upsert completed after emergency rolling eviction of ${emergencyEvicted} points.`);
+          return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
+        } catch (retryErr) {
+          console.error('[vectorService] Retry upsert after overlimit eviction failed:', retryErr);
+        }
+      }
       console.warn('[vectorService] Failed to upsert to Qdrant, falling back to memory store:', err);
     }
   }
@@ -509,8 +581,10 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
  * Returns vector database telemetry including capacity, rolling FIFO storage, and schema verification
  */
 export function getVectorStatus(): VectorStatus {
-  const currentCount = isQdrantReady ? cachedSchemaVerification.totalPoints || memoryStore.size : memoryStore.size;
-  const usagePct = Math.min(100, Math.round((currentCount / MAX_VECTOR_CAPACITY) * 100));
+  const isQdrant = isQdrantReady;
+  const currentCount = isQdrant ? cachedSchemaVerification.totalPoints || memoryStore.size : memoryStore.size;
+  const maxCap = isQdrant ? QDRANT_MAX_CAPACITY : LOCAL_MAX_CAPACITY;
+  const usagePct = Math.min(100, Math.round((currentCount / maxCap) * 100));
 
   // Find oldest record timestamp in memory
   let oldestTimestamp: number | undefined;
@@ -526,7 +600,9 @@ export function getVectorStatus(): VectorStatus {
     collectionName: COLLECTION_NAME,
     totalIndexed: currentCount,
     url: config.qdrantUrl,
-    maxCapacity: MAX_VECTOR_CAPACITY,
+    maxCapacity: maxCap,
+    localMaxCapacity: LOCAL_MAX_CAPACITY,
+    qdrantMaxCapacity: QDRANT_MAX_CAPACITY,
     storageUsagePct: usagePct,
     rollingBufferActive: true,
     totalEvicted: totalEvictedCount,
@@ -536,13 +612,16 @@ export function getVectorStatus(): VectorStatus {
       totalPoints: currentCount
     },
     offlineFallbackExplanation:
-      'When Qdrant is not running or port 6333 is unreachable, vectors are automatically hosted in the Node.js Engineered Dense Vector Space (Float64Array 384-d Cosine Proximity) with rolling FIFO buffer (Capacity: 2,000 points) and browser client-side caching. Active research sessions continue with zero interruption.'
+      'When Qdrant is not running or port 6333 is unreachable, vectors are automatically hosted in the Node.js Engineered Dense Vector Space (Float64Array Cosine Proximity) with rolling FIFO buffer (Capacity: 2,000 points; Qdrant capacity: 200,000 points or on overlimit) and browser client-side caching. Active research sessions continue with zero interruption.'
   };
 }
 
 export const vectorService = {
   COLLECTION_NAME,
   MAX_VECTOR_CAPACITY,
+  LOCAL_MAX_CAPACITY,
+  QDRANT_MAX_CAPACITY,
+  isQdrantOverlimitError,
   initQdrant,
   clearVectorStore,
   upsertDocuments,

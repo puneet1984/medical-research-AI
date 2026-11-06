@@ -4,7 +4,7 @@ FROM node:20-alpine AS frontend-builder
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 COPY index.html vite.config.ts tsconfig.json ./
 COPY src/ ./src/
@@ -15,10 +15,10 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV PORT=3000
+ENV PORT=3100
 
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev && npm install -g tsx
+RUN npm install --omit=dev --legacy-peer-deps
 
 # Copy compiled frontend SPA
 COPY --from=frontend-builder /app/dist ./dist
@@ -28,6 +28,6 @@ COPY server.ts ./
 COPY backend/ ./backend/
 COPY index.html ./
 
-EXPOSE 3000
+EXPOSE 3100
 
-CMD ["tsx", "server.ts"]
+CMD ["npx", "tsx", "server.ts"]

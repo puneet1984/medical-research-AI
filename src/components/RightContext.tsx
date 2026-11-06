@@ -669,7 +669,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                 <div className="flex justify-between text-[11px]">
                   <span className="text-slate-600 font-medium">Database Vector Capacity:</span>
                   <span className="font-mono font-semibold text-slate-800">
-                    {vectorStatus?.totalIndexed || documents.length} / {vectorStatus?.maxCapacity || 2000} vectors ({vectorStatus?.storageUsagePct || 1}% used)
+                    {(vectorStatus?.totalIndexed || documents.length).toLocaleString()} / {(vectorStatus?.maxCapacity || (vectorStatus?.activeBackend === 'qdrant' ? 200000 : 2000)).toLocaleString()} vectors ({vectorStatus?.storageUsagePct || 1}% used)
                   </span>
                 </div>
                 <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
@@ -677,6 +677,12 @@ export const RightContext: React.FC<RightContextProps> = ({
                     className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 rounded-full transition-all duration-500"
                     style={{ width: `${Math.max(2, Math.min(100, vectorStatus?.storageUsagePct || 1))}%` }}
                   />
+                </div>
+                <div className="flex justify-between items-center text-[10px] text-slate-500 pt-0.5">
+                  <span>Backend: <strong className="text-slate-700">{vectorStatus?.activeBackend === 'qdrant' ? 'Qdrant Dedicated Engine' : 'Node.js In-Memory Store'}</strong></span>
+                  <span className="font-mono text-[9px] bg-slate-100 px-1.5 py-0.5 rounded text-slate-600 font-medium">
+                    Limit: {vectorStatus?.activeBackend === 'qdrant' ? '200,000 (or on overlimit)' : '2,000 (rolling FIFO)'}
+                  </span>
                 </div>
               </div>
 
@@ -686,7 +692,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                   <span className="text-teal-700 font-semibold font-mono text-[10px]">FIFO Auto-Pruning</span>
                 </div>
                 <p className="text-[10px] text-slate-500 leading-relaxed">
-                  When vector storage reaches the maximum capacity (2,000 vectors), the database automatically removes the oldest indexed records (sorted by <code className="text-teal-700 bg-white px-1 rounded border border-slate-200">indexedAt</code> timestamp) before inserting new studies. Memory and disk boundaries are strictly preserved with zero overflow.
+                  When vector storage reaches maximum capacity (<strong>200,000 vectors</strong> for Qdrant, or <strong>2,000 vectors</strong> for local in-memory) or if Qdrant reports an <em>overlimit</em> condition, the database automatically removes the oldest indexed records (sorted by <code className="text-teal-700 bg-white px-1 rounded border border-slate-200">indexedAt</code> timestamp) before inserting new studies. Memory and disk boundaries are strictly preserved with zero overflow.
                 </p>
                 <div className="pt-1.5 border-t border-slate-200/70 flex items-center justify-between text-[10px] text-slate-500">
                   <span>Oldest Records Pruned by Rolling Buffer:</span>
@@ -706,10 +712,10 @@ export const RightContext: React.FC<RightContextProps> = ({
               </p>
               <ul className="list-disc pl-5 text-[11px] text-slate-600 space-y-1 leading-relaxed">
                 <li>
-                  <strong>Node.js Dense Vector Space:</strong> Embeddings are stored in normalized 384-dimensional <code className="text-blue-700 bg-white px-1 rounded border border-blue-200">Float64Array</code> memory vectors with high-precision Cosine Similarity ranking.
+                  <strong>Node.js Dense Vector Space:</strong> Embeddings are stored in normalized <code className="text-blue-700 bg-white px-1 rounded border border-blue-200">Float64Array</code> memory vectors with high-precision Cosine Similarity ranking.
                 </li>
                 <li>
-                  <strong>Identical FIFO Rolling Storage:</strong> The in-memory buffer enforces the exact same rolling capacity (2,000 vectors) to prevent memory leaks.
+                  <strong>FIFO Rolling Storage:</strong> The in-memory buffer enforces a 2,000-vector rolling capacity to protect Node.js heap memory, while Qdrant scales up to 200,000 vectors with automatic eviction on overlimit.
                 </li>
                 <li>
                   <strong>Client-Side Session Cache:</strong> Browser state and storage cache active study datasets and PICO matrices, ensuring continuous uninterrupted research across searches.

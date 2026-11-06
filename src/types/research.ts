@@ -90,6 +90,8 @@ export interface VectorStatusInfo {
   cachedVectorHits?: number;
   vectorAcceleration?: string;
   maxCapacity: number;
+  localMaxCapacity?: number;
+  qdrantMaxCapacity?: number;
   storageUsagePct: number;
   rollingBufferActive: boolean;
   totalEvicted: number;

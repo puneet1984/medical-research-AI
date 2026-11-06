@@ -8,18 +8,18 @@ services:
     container_name: medical_research_app
     restart: always
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-3100}:3100" 
     env_file:
       - .env
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=3100
       - DATA_DIR=/app/data
     volumes:
       # Persistent volume mount for runtime variables, API keys, models, and vector cache
       - medical_app_data:/app/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
