@@ -44,8 +44,8 @@ ${topDocs.map(d => `  - **${d.firstAuthor} et al. (${d.year}):** ${d.pico.primar
 ---
 
 ### Study Design Hierarchy & Risk of Bias
-- **Design Distribution:** Comprises ${topDocs.filter(d => d.pico.design === 'Randomized Controlled Trial').length} Randomized Controlled Trials, ${topDocs.filter(d => d.pico.design === 'Meta-Analysis').length} Meta-Analyses, and observational cohort analyses.
-- **Quality Tiering:** High methodological consistency across double-blind, placebo-controlled protocols with low attrition bias.
+- **Design Distribution:** Comprises ${topDocs.filter(d => d.pico.design === 'Randomized Controlled Trial').length} Randomized Controlled Trials, ${topDocs.filter(d => d.pico.design === 'Meta-Analysis').length} Meta-Analyses, ${topDocs.filter(d => d.pico.design === 'Systematic Review').length} Systematic Reviews, ${topDocs.filter(d => d.pico.design === 'Cohort Study').length} Cohort Studies, and ${topDocs.filter(d => d.pico.design === 'Case Report' || d.pico.design === 'Case Series').length} Case Reports/Series.
+- **Quality Tiering:** High methodological consistency across peer-reviewed clinical protocols with evidence grading based on Oxford CEBM criteria.
 
 ---
 

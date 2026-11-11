@@ -7,7 +7,7 @@ export interface PicoData {
   pValues: string[];
   hazardRatio?: string;
   riskRatio?: string;
-  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial';
+  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series';
 }
 
 export interface MedicalDocument {

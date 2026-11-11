@@ -13,7 +13,8 @@ const STUDY_DESIGNS = [
   'Randomized Controlled Trial',
   'Meta-Analysis',
   'Systematic Review',
-  'Cohort Study'
+  'Cohort Study',
+  'Case Report'
 ];
 
 const DATABASE_SOURCES = [
@@ -88,7 +89,8 @@ export const PicoFilterBar: React.FC<PicoFilterBarProps> = ({
               const label =
                 design === 'Randomized Controlled Trial' ? 'RCT' :
                 design === 'Meta-Analysis' ? 'Meta-Analysis' :
-                design === 'Systematic Review' ? 'Systematic Rev' : 'Cohort';
+                design === 'Systematic Review' ? 'Systematic Rev' :
+                design === 'Case Report' ? 'Case Report' : 'Cohort';
 
               return (
                 <button

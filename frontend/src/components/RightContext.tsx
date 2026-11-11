@@ -110,7 +110,7 @@ export const RightContext: React.FC<RightContextProps> = ({
       d.year,
       `"${d.journal.replace(/"/g, '""')}"`,
       `"${d.pico.design}"`,
-      d.pico.sampleSize,
+      d.pico.sampleSize > 0 ? d.pico.sampleSize : '"Not reported"',
       `"${d.pico.population.replace(/"/g, '""')}"`,
       `"${d.pico.intervention.replace(/"/g, '""')}"`,
       `"${d.pico.comparator.replace(/"/g, '""')}"`,
@@ -288,6 +288,8 @@ export const RightContext: React.FC<RightContextProps> = ({
                             ? 'bg-blue-50 text-blue-700 border border-blue-200'
                             : doc.pico.design === 'Meta-Analysis'
                             ? 'bg-purple-50 text-purple-700 border border-purple-200'
+                            : doc.pico.design === 'Case Report' || doc.pico.design === 'Case Series'
+                            ? 'bg-amber-50 text-amber-800 border border-amber-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                         }`}>
                           {doc.pico.design}
@@ -340,7 +342,11 @@ export const RightContext: React.FC<RightContextProps> = ({
                       <div className="bg-slate-50 rounded p-1.5 border border-slate-100">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Cohort Size:</span>
                         <span className="font-mono font-semibold text-slate-800">
-                          N = {doc.pico.sampleSize ? doc.pico.sampleSize.toLocaleString() : 'Documented cohort'}
+                          {doc.pico.sampleSize === 1
+                            ? 'N = 1 (Single Case)'
+                            : doc.pico.sampleSize > 1
+                            ? `N = ${doc.pico.sampleSize.toLocaleString()}`
+                            : 'N = Not reported'}
                         </span>
                       </div>
                       <div className="bg-slate-50 rounded p-1.5 border border-slate-100">
@@ -538,12 +544,24 @@ export const RightContext: React.FC<RightContextProps> = ({
                         <div className="text-[10px] text-slate-500">{doc.year} • {doc.journal.slice(0, 16)}...</div>
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 font-medium text-slate-700">
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                          doc.pico.design === 'Randomized Controlled Trial'
+                            ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                            : doc.pico.design === 'Meta-Analysis'
+                            ? 'bg-purple-50 text-purple-700 border border-purple-200'
+                            : doc.pico.design === 'Case Report' || doc.pico.design === 'Case Series'
+                            ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                            : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        }`}>
                           {doc.pico.design === 'Randomized Controlled Trial' ? 'RCT' : doc.pico.design}
                         </span>
                       </td>
                       <td className="p-2.5 font-mono whitespace-nowrap font-semibold text-slate-800">
-                        {doc.pico.sampleSize ? doc.pico.sampleSize.toLocaleString() : 'N/A'}
+                        {doc.pico.sampleSize === 1
+                          ? '1 (Case)'
+                          : doc.pico.sampleSize > 1
+                          ? doc.pico.sampleSize.toLocaleString()
+                          : <span className="text-slate-400 font-normal">Not reported</span>}
                       </td>
                       <td className="p-2.5 max-w-xs truncate text-slate-700" title={doc.pico.intervention}>
                         {doc.pico.intervention}

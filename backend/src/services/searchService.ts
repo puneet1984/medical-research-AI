@@ -16,7 +16,7 @@ export interface PicoData {
   pValues: string[];
   hazardRatio?: string;
   riskRatio?: string;
-  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial';
+  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series';
 }
 
 export type LiteratureDatabaseSource =
@@ -65,20 +65,154 @@ export function reconstructOpenAlexAbstract(
 }
 
 /**
- * Extracts sample size (N) from text using clinical regex patterns
+ * Comprehensive dictionary of English number words for parsing written clinical cohort sizes.
  */
-export function extractSampleSize(text: string): number {
-  const matches = text.match(/(?:n\s*=\s*|enrolled\s*|cohort of\s*|total of\s*|sample of\s*)(\d{1,3}(?:,\d{3})*|\d+)\s*(?:patients|participants|subjects|individuals|cases)/i);
-  if (matches && matches[1]) {
-    const parsed = parseInt(matches[1].replace(/,/g, ''), 10);
-    if (!isNaN(parsed) && parsed > 5) return parsed;
+const NUMBER_WORD_VALUES: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90
+};
+
+/**
+ * Parses English words (single words, hyphenated e.g. "Forty-seven", or compounds e.g. "one hundred and twenty")
+ * into their exact integer representation.
+ */
+export function parseWordsToNumber(raw: string): number | null {
+  if (!raw) return null;
+  const clean = raw.toLowerCase().replace(/-/g, ' ').replace(/\band\b/g, ' ').replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const tokens = clean.split(' ').filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  let total = 0;
+  let current = 0;
+  let hasValidWord = false;
+
+  for (const token of tokens) {
+    if (token in NUMBER_WORD_VALUES) {
+      current += NUMBER_WORD_VALUES[token];
+      hasValidWord = true;
+    } else if (token === 'hundred') {
+      current = (current === 0 ? 1 : current) * 100;
+      hasValidWord = true;
+    } else if (token === 'thousand') {
+      total += (current === 0 ? 1 : current) * 1000;
+      current = 0;
+      hasValidWord = true;
+    } else {
+      return null;
+    }
   }
-  const alt = text.match(/\b([1-9]\d{1,4})\s+(?:patients|participants|adults|individuals)\b/i);
-  if (alt && alt[1]) {
-    const parsed = parseInt(alt[1], 10);
-    if (!isNaN(parsed)) return parsed;
+
+  total += current;
+  return hasValidWord && total > 0 ? total : null;
+}
+
+const WORD_NUMBER_TOKEN = '(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)';
+const WORD_NUMBER_PHRASE = `(?:${WORD_NUMBER_TOKEN}(?:[- ](?:and[- ])?)?)+`;
+const CLINICAL_NOUNS = '(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs|limbs|implants|adults|children|infants|men|women)';
+const CLINICAL_QUALIFIERS = '(?:consecutive\\s+|elderly\\s+|adult\\s+|pediatric\\s+|female\\s+|male\\s+|unselected\\s+|eligible\\s+|evaluated\\s+|admitted\\s+)?';
+
+/**
+ * Extracts sample size (N) from text using clinical regex patterns and study design context.
+ * Accurately parses numbers written in words (e.g. "Forty-seven patients" -> 47).
+ * NEVER assumes or invents 350. If sample size is not specified in the abstract, returns 0.
+ * For single case reports, accurately returns 1 (or small case count for series).
+ */
+export function extractSampleSize(text: string, title = '', design?: PicoData['design']): number {
+  const combined = ((title || '') + ' ' + (text || ''))
+    .replace(/&#xa0;|&nbsp;|&#160;/gi, ' ')
+    .replace(/\u00a0/g, ' ')
+    .trim();
+
+  // 1. Case Report and Case Series Detection
+  const isCaseReport =
+    design === 'Case Report' ||
+    /\bcase\s+report\b/i.test(combined) ||
+    /\ba\s+case\s+of\b/i.test(combined) ||
+    /\breport\s+(?:of\s+)?a\s+case\b/i.test(combined) ||
+    /\bwe\s+report\s+a\s+case\b/i.test(combined) ||
+    /\bwe\s+present\s+a\s+case\b/i.test(combined) ||
+    /\bwe\s+describe\s+a\s+case\b/i.test(combined) ||
+    /\ba\s+rare\s+case\b/i.test(combined) ||
+    /\ba\s+\d{1,2}[-\s]year[-\s]old\s+(?:male|female|man|woman|patient|child|infant|boy|girl)\b/i.test(combined);
+
+  // If a specific small series count is described (e.g. "series of 3 cases", "two cases")
+  const caseSeriesCountMatch = combined.match(/\b(?:series\s+of|report\s+of|analyzed|evaluated|described|treated)\s+(\d{1,2})\s+cases\b/i);
+  if (caseSeriesCountMatch && caseSeriesCountMatch[1]) {
+    const parsed = parseInt(caseSeriesCountMatch[1], 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 50) return parsed;
   }
-  return 350;
+
+  // 2. Candidate collection for trials and cohort studies (both numbers in words and digits)
+  const candidates: number[] = [];
+
+  // Pattern A: Numbers written in words preceding clinical nouns (e.g. "Forty-seven patients", "eighty-two cases")
+  // Ensures hyphenated words like Forty-seven are captured whole without being split at the hyphen
+  const wordSampleRegex = new RegExp(`(^|[^a-zA-Z-])(${WORD_NUMBER_PHRASE})\\s+${CLINICAL_QUALIFIERS}${CLINICAL_NOUNS}\\b`, 'gi');
+  const wordMatches = [...combined.matchAll(wordSampleRegex)];
+  for (const wm of wordMatches) {
+    if (wm[2]) {
+      const parsed = parseWordsToNumber(wm[2]);
+      if (parsed && parsed > 0 && parsed < 10000000) {
+        candidates.push(parsed);
+      }
+    }
+  }
+
+  // Pattern B: Enrollment verbs with numbers written in words (e.g. "total of forty-seven", "enrolled sixty-two")
+  const verbWordRegex = new RegExp(`\\b(?:total\\s+of|cohort\\s+of|sample\\s+of|enrolled|recruited|analyzed|evaluated|included|consisted\\s+of|studied|operated\\s+on|treated)\\s+(?:a\\s+total\\s+of\\s+)?(${WORD_NUMBER_PHRASE})\\b`, 'gi');
+  const verbWordMatches = [...combined.matchAll(verbWordRegex)];
+  for (const vwm of verbWordMatches) {
+    if (vwm[1]) {
+      const parsed = parseWordsToNumber(vwm[1]);
+      if (parsed && parsed > 0 && parsed < 10000000) {
+        candidates.push(parsed);
+      }
+    }
+  }
+
+  // Pattern C: Clinical enrollment verbs with digits: "enrolled 142 patients", "total of 142 participants"
+  const enrolledMatch = combined.match(/\b(?:total\s+of|cohort\s+of|sample\s+of|enrolled|recruited|analyzed|evaluated|included|consisted\s+of|studied|operated\s+on|treated)\s+(?:a\s+total\s+of\s+)?(\d{1,3}(?:,\d{3})*|\d+)\s*(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs|limbs|implants)\b/i);
+  if (enrolledMatch && enrolledMatch[1]) {
+    const parsed = parseInt(enrolledMatch[1].replace(/,/g, ''), 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  }
+
+  // Pattern D: "X patients were randomized / enrolled / included / treated"
+  const wereMatch = combined.match(/\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs)\s+(?:were|with|undergoing|treated|randomized|enrolled|included|admitted|operated|received)\b/i);
+  if (wereMatch && wereMatch[1]) {
+    const parsed = parseInt(wereMatch[1].replace(/,/g, ''), 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  }
+
+  // Pattern E: Explicit N = / n = patterns (e.g. "N = 84", "n=120", "sample size of 250")
+  const explicitN = combined.match(/\b(?:[Nn]\s*=\s*|sample\s*size\s*(?:of|was|=)\s*)(\d{1,3}(?:,\d{3})*|\d+)\b/);
+  if (explicitN && explicitN[1]) {
+    const parsed = parseInt(explicitN[1].replace(/,/g, ''), 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  }
+
+  // Pattern F: General "X patients/participants/subjects"
+  const generalMatch = combined.match(/\b([1-9]\d{0,5})\s+(?:elderly\s+)?(?:patients|participants|adults|individuals|subjects)\b/i);
+  if (generalMatch && generalMatch[1]) {
+    const parsed = parseInt(generalMatch[1], 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  }
+
+  // If identified as a single case report and no larger cohort was found: exactly 1 patient
+  if (isCaseReport) {
+    const smallCandidate = candidates.find(c => c > 0 && c <= 10);
+    return smallCandidate || 1;
+  }
+
+  // If candidate cohort sizes were found, return the maximum (total trial cohort >= subgroup arm)
+  if (candidates.length > 0) {
+    return Math.max(...candidates);
+  }
+
+  // 3. If sample size is NOT stated in the text, return 0 (never make up 350)
+  return 0;
 }
 
 /**
@@ -101,18 +235,63 @@ export function extractPValues(text: string): string[] {
  */
 export function inferStudyDesign(title: string, abstract: string): PicoData['design'] {
   const combined = (title + ' ' + abstract).toLowerCase();
-  if (combined.includes('meta-analysis') || combined.includes('pooled analysis')) {
+
+  // 1. Systematic Review & Meta-Analysis
+  if (combined.includes('meta-analysis') || combined.includes('pooled analysis') || combined.includes('meta-analytic')) {
     return 'Meta-Analysis';
   }
-  if (combined.includes('systematic review') || combined.includes('prisma')) {
+  if (combined.includes('systematic review') || combined.includes('prisma') || combined.includes('scoping review')) {
     return 'Systematic Review';
   }
-  if (combined.includes('randomized') || combined.includes('placebo-controlled') || combined.includes('double-blind') || combined.includes('rct')) {
+
+  // 2. Randomized Controlled Trial
+  if (
+    combined.includes('randomized') ||
+    combined.includes('randomised') ||
+    combined.includes('placebo-controlled') ||
+    combined.includes('double-blind') ||
+    combined.includes('rct') ||
+    combined.includes('single-blind') ||
+    combined.includes('controlled clinical trial')
+  ) {
     return 'Randomized Controlled Trial';
   }
-  if (combined.includes('cohort') || combined.includes('longitudinal') || combined.includes('prospective')) {
+
+  // 3. Case Report & Case Series (Checked BEFORE general Cohort or Clinical Trial)
+  if (
+    /\bcase\s+series\b/i.test(combined) ||
+    /\bseries\s+of\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+cases\b/i.test(combined) ||
+    /\breport\s+of\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+cases\b/i.test(combined)
+  ) {
+    return 'Case Series';
+  }
+  if (
+    /\bcase\s+report\b/i.test(combined) ||
+    /\ba\s+case\s+of\b/i.test(combined) ||
+    /\breport\s+(?:of\s+)?a\s+case\b/i.test(combined) ||
+    /\breport\s+a\s+case\b/i.test(combined) ||
+    /\bwe\s+report\s+a\s+case\b/i.test(combined) ||
+    /\bwe\s+present\s+a\s+case\b/i.test(combined) ||
+    /\bwe\s+describe\s+a\s+case\b/i.test(combined) ||
+    /\ba\s+rare\s+case\b/i.test(combined) ||
+    /\ba\s+\d{1,2}[-\s]year[-\s]old\s+(?:male|female|man|woman|patient|child|infant|boy|girl)\b/i.test(combined)
+  ) {
+    return 'Case Report';
+  }
+
+  // 4. Cohort / Observational Study
+  if (
+    combined.includes('cohort') ||
+    combined.includes('longitudinal') ||
+    combined.includes('prospective') ||
+    combined.includes('retrospective') ||
+    combined.includes('observational') ||
+    combined.includes('cross-sectional') ||
+    combined.includes('case-control')
+  ) {
     return 'Cohort Study';
   }
+
   return 'Clinical Trial';
 }
 
@@ -121,7 +300,7 @@ export function inferStudyDesign(title: string, abstract: string): PicoData['des
  */
 export function extractPicoData(title: string, abstract: string): PicoData {
   const design = inferStudyDesign(title, abstract);
-  const sampleSize = extractSampleSize(title + ' ' + abstract);
+  const sampleSize = extractSampleSize(title + ' ' + abstract, title, design);
   const pValues = extractPValues(abstract);
 
   let hazardRatio: string | undefined;
