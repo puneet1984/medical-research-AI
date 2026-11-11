@@ -21,14 +21,14 @@ import {
   CheckCircle2,
   Share2
 } from 'lucide-react';
-import { SynthesisData, QueryExpansion, MedicalDocument } from '../types/research.js';
+import { SynthesisData, QueryExpansion, MedicalDocument } from '../types/research';
 
 interface LeftCanvasProps {
   query: string;
   onQueryChange: (q: string) => void;
   onExecuteSearch: (customQuery?: string) => void;
   isLoading: boolean;
-  activeStep: number;
+  activeStep: number; // 0 to 5
   synthesis: SynthesisData | null;
   expansion: QueryExpansion | null;
   documents: MedicalDocument[];
@@ -36,6 +36,8 @@ interface LeftCanvasProps {
   durationMs?: number;
   onGenerateSynthesis?: () => void;
   isSynthesizing?: boolean;
+  activeSynthesisModel?: string;
+  activeReasoningModel?: string;
 }
 
 export const LeftCanvas: React.FC<LeftCanvasProps> = ({
@@ -50,7 +52,9 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   onSelectCitation,
   durationMs,
   onGenerateSynthesis,
-  isSynthesizing = false
+  isSynthesizing = false,
+  activeSynthesisModel,
+  activeReasoningModel
 }) => {
   const [activeView, setActiveView] = useState<'report' | 'editor'>('report');
   const [editableMarkdown, setEditableMarkdown] = useState<string>('');
@@ -58,6 +62,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   const [isMetaMapExpanded, setIsMetaMapExpanded] = useState(true);
   const [copiedPubMed, setCopiedPubMed] = useState(false);
 
+  // Sync editable text when new synthesis arrives
   React.useEffect(() => {
     if (synthesis?.markdown) {
       setEditableMarkdown(synthesis.markdown);
@@ -91,6 +96,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   };
 
   const renderCitationPill = (text: string) => {
+    // Matches patterns like [McMurray, 2019 (10.1056/NEJMoa1911303)]
     const parts = text.split(/(\[[A-Za-z\s–-]+,\s*\d{4}\s*\([^)]+\)\])/g);
     return parts.map((part, index) => {
       const match = part.match(/^\[([A-Za-z\s–-]+),\s*(\d{4})\s*\(([^)]+)\)\]$/);
@@ -115,6 +121,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
   return (
     <div className="flex flex-col h-full bg-white overflow-hidden">
+      {/* 1. Clinical Query Input Workspace */}
       <div className="p-4 border-b border-slate-200 bg-slate-50/70">
         <form onSubmit={handleSubmit} className="space-y-3">
           <div className="relative flex items-center">
@@ -149,6 +156,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
           </div>
         </form>
 
+        {/* Agentic RAG Multi-Step Workflow Status */}
         {isLoading && (
           <div className="mt-3.5 pt-3 border-t border-slate-200">
             <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1">
@@ -194,6 +202,15 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                   <Brain className="w-3 h-3 text-blue-600" />
                   <span>NLM MetaMapLite</span>
                 </span>
+                {activeReasoningModel && (
+                  <span
+                    className="hidden sm:inline-flex items-center gap-1 text-[10px] font-mono text-teal-800 bg-teal-50/80 border border-teal-200 px-1.5 py-0.2 rounded font-medium"
+                    title={`Active Reasoning Model: ${activeReasoningModel}`}
+                  >
+                    <span>Reasoning:</span>
+                    <span className="font-semibold">{activeReasoningModel.split('/').pop()}</span>
+                  </span>
+                )}
                 <span className="text-[10px] text-slate-500 font-medium">
                   Lister Hill Center Biomedical NLP
                 </span>
@@ -233,6 +250,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
             {/* Expanded Full MetaMapLite Inspector */}
             {isMetaMapExpanded && (
               <div className="pt-2 space-y-2.5 text-[11px]">
+                {/* 1. Extracted Biomedical Concepts & Semantic Types */}
                 <div>
                   <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 flex items-center justify-between">
                     <span>UMLS Concepts &amp; Semantic Types:</span>
@@ -251,7 +269,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                             <span className="font-semibold text-slate-700">
                               {c.preferredName}
                             </span>
-                            <span className="font-mono text-[9px] px-1 py-0.2 bg-teal-50 text-teal-800 border border-teal-200 rounded">
+                            <span className="font-mono text-[9px] px-1 py-0.2 bg-teal-50 text-teal-800 border border-teal-200 rounded" title="UMLS Concept Unique Identifier">
                               CUI: {c.cui}
                             </span>
                           </div>
@@ -273,7 +291,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                                 : 'bg-slate-100 text-slate-700 border-slate-200';
 
                               return (
-                                <span key={j} className={`text-[9px] px-1.5 py-0.2 rounded border font-semibold ${badgeCls}`}>
+                                <span key={j} className={`text-[9px] px-1.5 py-0.2 rounded border font-semibold ${badgeCls}`} title={c.semanticTypeNames[j] || st}>
                                   [{st}] {c.semanticTypeNames[j] || st}
                                 </span>
                               );
@@ -285,6 +303,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-0.5 text-[9px] font-mono font-semibold px-1 py-0.2 bg-blue-50 text-blue-700 hover:text-blue-900 border border-blue-200 rounded hover:underline"
+                                title={`Inspect MeSH Descriptor ${c.meshId} in official NLM MeSH Browser`}
                               >
                                 <span>MeSH: {c.meshId}</span>
                                 <ExternalLink className="w-2.5 h-2.5" />
@@ -305,6 +324,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                   </div>
                 </div>
 
+                {/* 2. Comparative Clinical Arms Breakdown if comparative */}
                 {expansion.metaMap?.isComparative && expansion.metaMap.comparativeDetails && (
                   <div className="p-2 bg-blue-50/40 rounded border border-blue-100 space-y-1 text-[10px]">
                     <div className="font-semibold text-blue-900 flex items-center justify-between">
@@ -332,6 +352,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                   </div>
                 )}
 
+                {/* 3. Formulated Optimized PubMed Search Query */}
                 <div>
                   <div className="flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">
                     <span>Optimized PubMed Search Syntax:</span>
@@ -345,6 +366,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                           setTimeout(() => setCopiedPubMed(false), 2000);
                         }}
                         className="inline-flex items-center gap-1 text-[10px] font-semibold text-teal-700 hover:text-teal-900 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-1.5 py-0.5 rounded cursor-pointer transition-colors"
+                        title="Copy PubMed search syntax to clipboard"
                       >
                         {copiedPubMed ? (
                           <>
@@ -364,6 +386,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-1.5 py-0.5 rounded transition-colors"
+                        title="Execute this exact query in PubMed (NCBI)"
                       >
                         <span>Run in PubMed</span>
                         <ExternalLink className="w-2.5 h-2.5" />
@@ -381,6 +404,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
         )}
       </div>
 
+      {/* 2. Synthesis Workspace Header Bar */}
       <div className="px-4 py-2 border-b border-slate-200 bg-white flex items-center justify-between">
         <div className="flex items-center space-x-2">
           <button
@@ -408,6 +432,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
           </button>
         </div>
 
+        {/* Metadata & Actions */}
         <div className="flex items-center gap-2">
           {onGenerateSynthesis && documents.length > 0 && (
             <button
@@ -435,9 +460,13 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
             </span>
           )}
 
-          {synthesis?.modelUsed && (
-            <span className="text-[10px] font-mono bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded border border-slate-200">
-              {synthesis.modelUsed}
+          {(synthesis?.modelUsed || activeSynthesisModel) && (
+            <span
+              className="text-[10px] font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-200 flex items-center gap-1"
+              title={`Clinical evidence synthesis model: ${synthesis?.modelUsed || activeSynthesisModel}`}
+            >
+              <Cpu className="w-2.5 h-2.5 text-teal-600" />
+              <span>{synthesis?.modelUsed || activeSynthesisModel}</span>
             </span>
           )}
 
@@ -463,6 +492,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
         </div>
       </div>
 
+      {/* 3. Synthesis Body (Markdown Viewer or Clinical Note Editor) */}
       <div className="flex-1 overflow-y-auto p-6">
         {activeView === 'report' ? (
           <div className="max-w-3xl mx-auto prose prose-slate prose-sm text-slate-800">
@@ -486,6 +516,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
+                  // Render custom paragraph with clickable citations
                   p: ({ children }) => {
                     const content = React.Children.map(children, child => {
                       if (typeof child === 'string') {

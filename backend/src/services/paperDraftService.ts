@@ -1,5 +1,6 @@
 import { executeInference } from './openRouterService.js';
 import { MedicalDocument } from './searchService.js';
+import { config } from '../config.js';
 
 export interface PaperSection {
   id: string;
@@ -192,6 +193,7 @@ Return ONLY a valid JSON object with this exact shape:
   let parsedResponse: any = null;
   try {
     const inferenceResult = await executeInference(userPrompt, {
+      model: config.llmSynthesisModel,
       systemPrompt,
       temperature: 0.2,
       maxTokens: 5000
@@ -286,6 +288,7 @@ Return ONLY the revised section content text. Do not wrap text in LaTeX dollar s
 
   try {
     const result = await executeInference(prompt, {
+      model: config.llmSynthesisModel,
       systemPrompt: `You are an expert clinical editor for ${targetJournal}. Return polished, publication-ready academic medical text. Never use LaTeX dollar signs ($p < 0.05$). Avoid robotic jargon.`,
       temperature: 0.25,
       maxTokens: 2500

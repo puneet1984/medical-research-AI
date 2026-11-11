@@ -1,3 +1,8 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   Stethoscope,
@@ -7,33 +12,42 @@ import {
   PenTool,
   LayoutDashboard
 } from 'lucide-react';
-import { LeftCanvas } from './components/LeftCanvas.js';
-import { RightContext } from './components/RightContext.js';
-import { PicoFilterBar } from './components/PicoFilterBar.js';
-import { SettingsModal } from './components/SettingsModal.js';
-import { AiPaperWriter } from './components/AiPaperWriter.js';
+import { LeftCanvas } from './components/LeftCanvas';
+import { RightContext } from './components/RightContext';
+import { PicoFilterBar } from './components/PicoFilterBar';
+import { SettingsModal } from './components/SettingsModal';
+import { AiPaperWriter } from './components/AiPaperWriter';
 import {
   MedicalDocument,
   SynthesisData,
   QueryExpansion,
   VectorStatusInfo,
-  PicoFilters
-} from './types/research.js';
+  PicoFilters,
+  SettingsData
+} from './types/research';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workspace' | 'writer'>('workspace');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [activeStep, setActiveStep] = useState(0);
+  const [activeStep, setActiveStep] = useState(0); // 0 = idle, 1..5 = steps
   const [documents, setDocuments] = useState<MedicalDocument[]>([]);
   const [synthesis, setSynthesis] = useState<SynthesisData | null>(null);
   const [expansion, setExpansion] = useState<QueryExpansion | null>(null);
   const [vectorStatus, setVectorStatus] = useState<VectorStatusInfo | null>(null);
+  const [activeSettings, setActiveSettings] = useState<SettingsData | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | undefined>();
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Pagination & lazy hydration state
+  const [totalAvailableStudies, setTotalAvailableStudies] = useState<number>(0);
+  const [hasMore, setHasMore] = useState<boolean>(false);
+  const [nextOffset, setNextOffset] = useState<number>(0);
+  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
+
+  // PICO Filters state
   const [filters, setFilters] = useState<PicoFilters>({
     designs: [],
     minSample: 0,
@@ -43,12 +57,7 @@ export default function App() {
     sourceDatabases: []
   });
 
-  // Pagination & lazy hydration state
-  const [totalAvailableStudies, setTotalAvailableStudies] = useState<number>(0);
-  const [hasMore, setHasMore] = useState<boolean>(false);
-  const [nextOffset, setNextOffset] = useState<number>(0);
-  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
-
+  // Fetch vector engine telemetry
   const fetchStatus = async () => {
     try {
       const res = await fetch('/api/vector-status');
@@ -61,8 +70,22 @@ export default function App() {
     }
   };
 
+  // Fetch active settings and model configuration
+  const fetchActiveSettings = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.settings) setActiveSettings(data.settings);
+      }
+    } catch {
+      // Dev mode fallback
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
+    fetchActiveSettings();
   }, []);
 
   const executeSearch = async (overrideQuery?: string) => {
@@ -70,8 +93,10 @@ export default function App() {
     if (!q.trim() || isLoading) return;
 
     setIsLoading(true);
+    setErrorMsg(null);
     setActiveStep(1);
 
+    // Simulate animated step transitions for realistic Agentic RAG observability
     const t1 = setTimeout(() => setActiveStep(2), 500);
     const t2 = setTimeout(() => setActiveStep(3), 1100);
     const t3 = setTimeout(() => setActiveStep(4), 1600);
@@ -98,11 +123,13 @@ export default function App() {
       if (data.vectorStatus) setVectorStatus(data.vectorStatus);
       if (data.durationMs) setDurationMs(data.durationMs);
 
+      // Select first document by default
       if (data.documents && data.documents.length > 0) {
         setActiveDocumentId(data.documents[0].id);
       }
     } catch (err) {
       console.error('[App] Search failed:', err);
+      setErrorMsg(err instanceof Error ? err.message : 'Search processing encountered an issue.');
     } finally {
       clearTimeout(t1);
       clearTimeout(t2);
@@ -169,24 +196,33 @@ export default function App() {
     }
   };
 
+  // Filtered documents calculation
   const filteredDocuments = useMemo(() => {
     return documents.filter(doc => {
+      // 0. Database source filter (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex)
       if (filters.sourceDatabases && filters.sourceDatabases.length > 0) {
-        if (!filters.sourceDatabases.includes(doc.source)) return false;
+        if (!filters.sourceDatabases.includes(doc.source)) {
+          return false;
+        }
       }
+      // 1. Study design filter
       if (filters.designs.length > 0 && !filters.designs.includes(doc.pico.design)) {
         return false;
       }
+      // 2. Minimum sample size N
       if (filters.minSample > 0 && (doc.pico.sampleSize || 0) < filters.minSample) {
         return false;
       }
+      // 3. Publication Year
       if (filters.yearFrom > 0 && doc.year < filters.yearFrom) {
         return false;
       }
+      // 4. Statistical significance (p < 0.05)
       if (filters.statSignificantOnly) {
         const hasSigP = doc.pico.pValues.some(p => p.includes('< 0.001') || p.includes('< 0.01') || p.includes('< 0.05'));
         if (!hasSigP && !doc.pico.hazardRatio) return false;
       }
+      // 5. Search text filter
       if (filters.searchFilterText) {
         const term = filters.searchFilterText.toLowerCase();
         const matches = doc.title.toLowerCase().includes(term) ||
@@ -198,6 +234,7 @@ export default function App() {
     });
   }, [documents, filters]);
 
+  // Click handler from LeftCanvas citation pills
   const handleSelectCitation = (authorOrDoi: string) => {
     const cleanSearch = authorOrDoi.toLowerCase().trim();
     const target = documents.find(d =>
@@ -265,6 +302,7 @@ export default function App() {
 
         {/* System & Model Telemetry + Settings Button */}
         <div className="flex items-center space-x-2 sm:space-x-3">
+          {/* Vector engine badge */}
           <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-50 border border-slate-200 text-xs">
             <div className={`w-2 h-2 rounded-full ${vectorStatus?.isQdrantConnected ? 'bg-emerald-500 animate-pulse' : 'bg-teal-500'}`} />
             <span className="text-slate-500 text-[11px] font-medium">Vector DB:</span>
@@ -273,14 +311,35 @@ export default function App() {
             </span>
           </div>
 
-          <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-50 border border-slate-200 text-xs">
-            <Cpu className="w-3.5 h-3.5 text-teal-600" />
-            <span className="text-slate-500 text-[11px] font-medium">Inference:</span>
-            <span className="font-mono text-[11px] font-semibold text-slate-800">
-              {synthesis?.modelUsed || 'DeepSeek-R1 / Gemini'}
-            </span>
-          </div>
+          {/* Active AI Models Badge (Reasoning + Synthesis) */}
+          <button
+            type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs shadow-2xs transition-colors cursor-pointer"
+            title={`Active AI Models (Click to configure in Settings):\n• Reasoning: ${activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free'}\n• Synthesis: ${synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free'}\n• Embeddings: ${activeSettings?.embeddingProvider || 'gemini'}`}
+          >
+            <Cpu className="w-3.5 h-3.5 text-teal-600 shrink-0" />
 
+            {/* Reasoning Model */}
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="text-slate-500 font-medium">Reasoning:</span>
+              <span className="font-mono font-semibold text-slate-800 truncate max-w-[130px]">
+                {(activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free').split('/').pop()}
+              </span>
+            </div>
+
+            <span className="text-slate-300">•</span>
+
+            {/* Synthesis Model */}
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="text-slate-500 font-medium">Synthesis:</span>
+              <span className="font-mono font-semibold text-teal-800 truncate max-w-[130px]">
+                {(synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free').split('/').pop()}
+              </span>
+            </div>
+          </button>
+
+          {/* Evidence Provenance */}
           <div className="hidden xl:flex items-center gap-1 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
             <ShieldCheck className="w-3.5 h-3.5" />
             <span className="font-medium">PubMed + DOAJ + Scopus</span>
@@ -301,6 +360,7 @@ export default function App() {
       {/* Main Content Area */}
       {activeTab === 'workspace' ? (
         <>
+          {/* 2. PICO Metadata Controls Filter Bar */}
           <PicoFilterBar
             filters={filters}
             onFilterChange={setFilters}
@@ -308,7 +368,9 @@ export default function App() {
             filteredCount={filteredDocuments.length}
           />
 
+          {/* 3. Main Split-Screen Workspace (60% / 40% Dual-Pane) */}
           <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
+            {/* Left Canvas: Synthesis Workspace & Editor (60% width) */}
             <div className="w-full md:w-[60%] h-full flex flex-col overflow-hidden">
               <LeftCanvas
                 query={query}
@@ -323,9 +385,12 @@ export default function App() {
                 durationMs={durationMs}
                 onGenerateSynthesis={handleGenerateSynthesis}
                 isSynthesizing={isSynthesizing}
+                activeSynthesisModel={activeSettings?.llmSynthesisModel}
+                activeReasoningModel={activeSettings?.llmReasoningModel}
               />
             </div>
 
+            {/* Right Context: Document Viewer & Source Tabs (40% width) */}
             <div className="w-full md:w-[40%] h-full flex flex-col overflow-hidden">
               <RightContext
                 documents={filteredDocuments}
@@ -342,6 +407,7 @@ export default function App() {
           </main>
         </>
       ) : (
+        /* AI Editor & Writer View */
         <main className="flex-1 overflow-hidden">
           <AiPaperWriter
             initialQuery={query}
@@ -354,7 +420,10 @@ export default function App() {
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
-        onSettingsSaved={fetchStatus}
+        onSettingsSaved={() => {
+          fetchStatus();
+          fetchActiveSettings();
+        }}
       />
     </div>
   );

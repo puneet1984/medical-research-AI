@@ -163,7 +163,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setGeminiEmbeddingModel(s.geminiEmbeddingModel || 'text-embedding-004');
         setOpenRouterEmbeddingModel(s.openRouterEmbeddingModel || 'openai/text-embedding-3-small');
         setHuggingFaceMasked(s.huggingFaceApiKeyMasked || '');
-        setHuggingFaceEmbeddingModel(s.huggingFaceEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2');
+        setHuggingFaceEmbeddingModel(s.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed');
 
         setScholarlyEmail(s.scholarlyEmail || 'researcher@domain.com');
         setNcbiMasked(s.ncbiApiKeyMasked || '');
@@ -279,19 +279,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     const payload: Record<string, unknown> = {
       llmProvider,
-      llmReasoningModel,
-      llmSynthesisModel,
-      ollamaUrl,
-      ollamaLlmModel,
-      ollamaEmbeddingModel,
-      omniRouteUrl,
-      omniRouteLlmModel,
+      llmReasoningModel: (llmReasoningModel || '').trim() || 'deepseek/deepseek-r1',
+      llmSynthesisModel: (llmSynthesisModel || '').trim() || 'meta-llama/llama-3.3-70b-instruct',
+      ollamaUrl: (ollamaUrl || '').trim() || 'http://localhost:11434',
+      ollamaLlmModel: (ollamaLlmModel || '').trim() || 'llama3:latest',
+      ollamaEmbeddingModel: (ollamaEmbeddingModel || '').trim() || 'nomic-embed-text',
+      omniRouteUrl: (omniRouteUrl || '').trim(),
+      omniRouteLlmModel: (omniRouteLlmModel || '').trim() || 'deepseek/deepseek-r1',
       embeddingProvider,
-      geminiEmbeddingModel,
-      openRouterEmbeddingModel,
-      huggingFaceEmbeddingModel,
-      scholarlyEmail,
-      qdrantUrl
+      geminiEmbeddingModel: (geminiEmbeddingModel || '').trim() || 'text-embedding-004',
+      openRouterEmbeddingModel: (openRouterEmbeddingModel || '').trim() || 'openai/text-embedding-3-small',
+      huggingFaceEmbeddingModel: (huggingFaceEmbeddingModel || '').trim() || 'monologg/biobert_v1.1_pubmed',
+      scholarlyEmail: (scholarlyEmail || '').trim() || 'researcher@domain.com',
+      qdrantUrl: (qdrantUrl || '').trim() || 'http://localhost:6333'
     };
 
     if (geminiApiKey.trim()) payload.geminiApiKey = geminiApiKey.trim();
@@ -311,9 +311,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (data.success) {
+        if (data.settings) {
+          const s: SettingsData = data.settings;
+          if (s.llmProvider) setLlmProvider(s.llmProvider);
+          if (s.llmReasoningModel) setLlmReasoningModel(s.llmReasoningModel);
+          if (s.llmSynthesisModel) setLlmSynthesisModel(s.llmSynthesisModel);
+          if (s.ollamaUrl) setOllamaUrl(s.ollamaUrl);
+          if (s.ollamaLlmModel) setOllamaLlmModel(s.ollamaLlmModel);
+          if (s.ollamaEmbeddingModel) setOllamaEmbeddingModel(s.ollamaEmbeddingModel);
+          if (s.omniRouteUrl !== undefined) setOmniRouteUrl(s.omniRouteUrl);
+          if (s.omniRouteLlmModel) setOmniRouteLlmModel(s.omniRouteLlmModel);
+          if (s.embeddingProvider) setEmbeddingProvider(s.embeddingProvider);
+          if (s.geminiEmbeddingModel) setGeminiEmbeddingModel(s.geminiEmbeddingModel);
+          if (s.openRouterEmbeddingModel) setOpenRouterEmbeddingModel(s.openRouterEmbeddingModel);
+          if (s.huggingFaceEmbeddingModel) setHuggingFaceEmbeddingModel(s.huggingFaceEmbeddingModel);
+          if (s.scholarlyEmail) setScholarlyEmail(s.scholarlyEmail);
+          if (s.qdrantUrl) setQdrantUrl(s.qdrantUrl);
+          if (s.openRouterApiKeyMasked) setOpenRouterMasked(s.openRouterApiKeyMasked);
+          if (s.geminiApiKeyMasked) setGeminiMasked(s.geminiApiKeyMasked);
+          if (s.omniRouteApiKeyMasked) setOmniRouteMasked(s.omniRouteApiKeyMasked);
+          if (s.huggingFaceApiKeyMasked) setHuggingFaceMasked(s.huggingFaceApiKeyMasked);
+          if (s.ncbiApiKeyMasked) setNcbiMasked(s.ncbiApiKeyMasked);
+          if (s.qdrantApiKeyMasked) setQdrantMasked(s.qdrantApiKeyMasked);
+        }
+
+        // Clear plain text credentials from component state
+        setOpenRouterApiKey('');
+        setGeminiApiKey('');
+        setOmniRouteApiKey('');
+        setHuggingFaceApiKey('');
+        setNcbiApiKey('');
+        setQdrantApiKey('');
+
         setSaveSuccess(true);
         if (onSettingsSaved) onSettingsSaved();
-        setTimeout(() => setSaveSuccess(false), 3500);
+        setTimeout(() => setSaveSuccess(false), 4500);
       }
     } catch (err) {
       console.error('Failed to save settings:', err);
@@ -390,9 +422,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {/* Content form */}
         <form onSubmit={handleSave} className="flex-1 overflow-y-auto p-6 space-y-6 text-sm">
           {saveSuccess && (
-            <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg flex items-center gap-2 text-xs font-medium">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span>Runtime environment updated successfully! All variables, Qdrant endpoints, and credentials have been saved to /app/data and applied immediately.</span>
+            <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg flex items-center gap-2.5 text-xs font-medium">
+              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+              <div>
+                <div className="font-semibold text-emerald-900">
+                  Settings &amp; AI models saved and applied immediately!
+                </div>
+                <div className="text-[11px] text-emerald-700 mt-0.5 font-normal">
+                  Reasoning: <span className="font-mono font-semibold">{llmReasoningModel}</span> • Synthesis: <span className="font-mono font-semibold">{llmSynthesisModel}</span> • Embeddings: <span className="font-mono font-semibold">{embeddingProvider}</span> • Persisted to volume storage at <code className="bg-emerald-100/70 px-1 rounded">/app/data/persistent-settings.json</code>.
+                </div>
+              </div>
             </div>
           )}
 

@@ -320,8 +320,9 @@ export async function handleMetaMapExtract(req: Request, res: Response): Promise
 // Settings & Runtime Configuration Handlers
 // -------------------------------------------------------------
 
-import { getSanitizedConfig, updateRuntimeConfig } from '../config.js';
-import { testConnection, fetchOpenRouterModels } from '../services/openRouterService.js';
+import { getSanitizedConfig, updateRuntimeConfig, config } from '../config.js';
+import { testConnection, fetchOpenRouterModels, resetGeminiClient } from '../services/openRouterService.js';
+import { getActiveEmbeddingInfo, setEmbeddingDimension } from '../services/embeddingService.js';
 import {
   generatePaperDraft,
   transformSection
@@ -344,12 +345,31 @@ export function handleUpdateSettings(req: Request, res: Response): void {
 
     const updated = updateRuntimeConfig(updates);
 
+    // If embedding provider or models changed, dynamically re-calculate dimension
+    if (
+      updates.embeddingProvider !== undefined ||
+      updates.geminiEmbeddingModel !== undefined ||
+      updates.openRouterEmbeddingModel !== undefined ||
+      updates.huggingFaceEmbeddingModel !== undefined ||
+      updates.ollamaEmbeddingModel !== undefined
+    ) {
+      const activeEmb = getActiveEmbeddingInfo();
+      setEmbeddingDimension(activeEmb.dimension);
+      console.log(`[researchController] Synchronized vector dimension for active model (${activeEmb.provider}/${activeEmb.model}): ${activeEmb.dimension}-d`);
+    }
+
+    if (updates.geminiApiKey !== undefined) {
+      resetGeminiClient();
+    }
+
     // If Qdrant settings changed, re-initialize vector connection in background
     if (updates.qdrantUrl !== undefined || updates.qdrantApiKey !== undefined) {
       initQdrant().catch(err => {
         console.warn('[researchController] Qdrant re-init notice:', err);
       });
     }
+
+    console.log(`[researchController] Settings & models updated. Reasoning: "${config.llmReasoningModel}", Synthesis: "${config.llmSynthesisModel}", Provider: "${config.llmProvider}"`);
 
     res.json({
       success: true,

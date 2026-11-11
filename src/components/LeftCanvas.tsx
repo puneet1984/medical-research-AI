@@ -36,6 +36,8 @@ interface LeftCanvasProps {
   durationMs?: number;
   onGenerateSynthesis?: () => void;
   isSynthesizing?: boolean;
+  activeSynthesisModel?: string;
+  activeReasoningModel?: string;
 }
 
 export const LeftCanvas: React.FC<LeftCanvasProps> = ({
@@ -50,7 +52,9 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   onSelectCitation,
   durationMs,
   onGenerateSynthesis,
-  isSynthesizing = false
+  isSynthesizing = false,
+  activeSynthesisModel,
+  activeReasoningModel
 }) => {
   const [activeView, setActiveView] = useState<'report' | 'editor'>('report');
   const [editableMarkdown, setEditableMarkdown] = useState<string>('');
@@ -198,6 +202,15 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                   <Brain className="w-3 h-3 text-blue-600" />
                   <span>NLM MetaMapLite</span>
                 </span>
+                {activeReasoningModel && (
+                  <span
+                    className="hidden sm:inline-flex items-center gap-1 text-[10px] font-mono text-teal-800 bg-teal-50/80 border border-teal-200 px-1.5 py-0.2 rounded font-medium"
+                    title={`Active Reasoning Model: ${activeReasoningModel}`}
+                  >
+                    <span>Reasoning:</span>
+                    <span className="font-semibold">{activeReasoningModel.split('/').pop()}</span>
+                  </span>
+                )}
                 <span className="text-[10px] text-slate-500 font-medium">
                   Lister Hill Center Biomedical NLP
                 </span>
@@ -447,9 +460,13 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
             </span>
           )}
 
-          {synthesis?.modelUsed && (
-            <span className="text-[10px] font-mono bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded border border-slate-200">
-              {synthesis.modelUsed}
+          {(synthesis?.modelUsed || activeSynthesisModel) && (
+            <span
+              className="text-[10px] font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-200 flex items-center gap-1"
+              title={`Clinical evidence synthesis model: ${synthesis?.modelUsed || activeSynthesisModel}`}
+            >
+              <Cpu className="w-2.5 h-2.5 text-teal-600" />
+              <span>{synthesis?.modelUsed || activeSynthesisModel}</span>
             </span>
           )}
 

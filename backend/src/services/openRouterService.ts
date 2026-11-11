@@ -75,6 +75,10 @@ async function callOpenRouter(
   return content;
 }
 
+export function resetGeminiClient(): void {
+  geminiClient = null;
+}
+
 /**
  * Calls Gemini as native server-side inference engine
  */
@@ -82,7 +86,7 @@ async function callGemini(
   prompt: string,
   options: CompletionOptions = {}
 ): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY || config.geminiApiKey;
+  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY not configured');
   }
@@ -98,8 +102,20 @@ async function callGemini(
     });
   }
 
+  // Resolve model dynamically: respect options.model if specified or gemini-2.5-flash
+  let modelName = 'gemini-2.5-flash';
+  if (options.model && typeof options.model === 'string' && options.model.trim()) {
+    const raw = options.model.trim().toLowerCase();
+    if (raw.includes('gemini')) {
+      const stripped = options.model.split('/').pop()?.replace(':free', '') || options.model;
+      if (stripped.startsWith('gemini')) {
+        modelName = stripped;
+      }
+    }
+  }
+
   const response = await geminiClient.models.generateContent({
-    model: 'gemini-3.8-flash',
+    model: modelName,
     contents: prompt,
     config: {
       systemInstruction: options.systemPrompt || 'You are an expert clinical epidemiologist and evidence-based medicine researcher.'
@@ -265,11 +281,12 @@ export async function executeInference(
   }
 
   // 4. Fallback to Gemini
-  const geminiKey = process.env.GEMINI_API_KEY || config.geminiApiKey;
+  const geminiKey = config.geminiApiKey || process.env.GEMINI_API_KEY;
   if (preferred === 'gemini' || (geminiKey && geminiKey.trim() !== '')) {
     try {
-      const text = await callGemini(prompt, options);
-      return { text, provider: 'gemini', modelUsed: 'gemini-3.8-flash' };
+      const model = options.model || (preferred === 'gemini' ? config.llmSynthesisModel : 'gemini-2.5-flash');
+      const text = await callGemini(prompt, { ...options, model });
+      return { text, provider: 'gemini', modelUsed: model };
     } catch (err) {
       console.warn('[openRouterService] Gemini call failed:', err instanceof Error ? err.message : err);
     }

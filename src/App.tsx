@@ -22,7 +22,8 @@ import {
   SynthesisData,
   QueryExpansion,
   VectorStatusInfo,
-  PicoFilters
+  PicoFilters,
+  SettingsData
 } from './types/research';
 
 export default function App() {
@@ -35,6 +36,7 @@ export default function App() {
   const [synthesis, setSynthesis] = useState<SynthesisData | null>(null);
   const [expansion, setExpansion] = useState<QueryExpansion | null>(null);
   const [vectorStatus, setVectorStatus] = useState<VectorStatusInfo | null>(null);
+  const [activeSettings, setActiveSettings] = useState<SettingsData | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | undefined>();
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -68,8 +70,22 @@ export default function App() {
     }
   };
 
+  // Fetch active settings and model configuration
+  const fetchActiveSettings = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.settings) setActiveSettings(data.settings);
+      }
+    } catch {
+      // Dev mode fallback
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
+    fetchActiveSettings();
   }, []);
 
   const executeSearch = async (overrideQuery?: string) => {
@@ -295,14 +311,33 @@ export default function App() {
             </span>
           </div>
 
-          {/* AI Inference engine badge */}
-          <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-50 border border-slate-200 text-xs">
-            <Cpu className="w-3.5 h-3.5 text-teal-600" />
-            <span className="text-slate-500 text-[11px] font-medium">Inference:</span>
-            <span className="font-mono text-[11px] font-semibold text-slate-800">
-              {synthesis?.modelUsed || 'DeepSeek-R1 / Gemini'}
-            </span>
-          </div>
+          {/* Active AI Models Badge (Reasoning + Synthesis) */}
+          <button
+            type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs shadow-2xs transition-colors cursor-pointer"
+            title={`Active AI Models (Click to configure in Settings):\n• Reasoning: ${activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free'}\n• Synthesis: ${synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free'}\n• Embeddings: ${activeSettings?.embeddingProvider || 'gemini'}`}
+          >
+            <Cpu className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+
+            {/* Reasoning Model */}
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="text-slate-500 font-medium">Reasoning:</span>
+              <span className="font-mono font-semibold text-slate-800 truncate max-w-[130px]">
+                {(activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free').split('/').pop()}
+              </span>
+            </div>
+
+            <span className="text-slate-300">•</span>
+
+            {/* Synthesis Model */}
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="text-slate-500 font-medium">Synthesis:</span>
+              <span className="font-mono font-semibold text-teal-800 truncate max-w-[130px]">
+                {(synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free').split('/').pop()}
+              </span>
+            </div>
+          </button>
 
           {/* Evidence Provenance */}
           <div className="hidden xl:flex items-center gap-1 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
@@ -350,6 +385,8 @@ export default function App() {
                 durationMs={durationMs}
                 onGenerateSynthesis={handleGenerateSynthesis}
                 isSynthesizing={isSynthesizing}
+                activeSynthesisModel={activeSettings?.llmSynthesisModel}
+                activeReasoningModel={activeSettings?.llmReasoningModel}
               />
             </div>
 
@@ -383,7 +420,10 @@ export default function App() {
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
-        onSettingsSaved={fetchStatus}
+        onSettingsSaved={() => {
+          fetchStatus();
+          fetchActiveSettings();
+        }}
       />
     </div>
   );
