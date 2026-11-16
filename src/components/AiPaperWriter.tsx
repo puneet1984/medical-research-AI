@@ -35,6 +35,8 @@ import {
 interface AiPaperWriterProps {
   initialQuery?: string;
   evidenceDocuments?: MedicalDocument[];
+  totalAvailableStudies?: number;
+  totalIndexedStudies?: number;
 }
 
 const TARGET_JOURNALS = [
@@ -56,17 +58,19 @@ const CITATION_STYLES: { id: CitationStyle; label: string; desc: string }[] = [
 
 export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
   initialQuery = 'SGLT2 inhibitors clinical outcomes in heart failure with preserved ejection fraction',
-  evidenceDocuments = []
+  evidenceDocuments = [],
+  totalAvailableStudies = 0,
+  totalIndexedStudies = 0
 }) => {
   const [researchQuestion, setResearchQuestion] = useState(initialQuery);
   const [targetJournal, setTargetJournal] = useState(TARGET_JOURNALS[0].name);
   const [citationStyle, setCitationStyle] = useState<CitationStyle>('Vancouver');
   const [selectedDatabases, setSelectedDatabases] = useState<string[]>([
     'PubMed',
+    'PMC',
+    'OpenAlex',
     'DOAJ',
-    'Google Scholar',
-    'Scopus',
-    'OpenAlex'
+    'Crossref'
   ]);
   const [draftMode, setDraftMode] = useState<'outline' | 'full_draft'>('full_draft');
 
@@ -84,6 +88,12 @@ export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
     setIsGenerating(true);
 
     try {
+      const retrievalStats = {
+        totalIndexed: Math.max(totalIndexedStudies, totalAvailableStudies, evidenceDocuments.length),
+        uniqueIncluded: evidenceDocuments.length,
+        databasesQueried: selectedDatabases
+      };
+
       const res = await fetch('/api/paper-draft/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -93,7 +103,8 @@ export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
           targetDatabases: selectedDatabases,
           citationStyle,
           mode: draftMode,
-          clinicalEvidence: evidenceDocuments
+          clinicalEvidence: evidenceDocuments,
+          retrievalStats
         })
       });
 
@@ -124,16 +135,25 @@ export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
     setActionLoading(prev => ({ ...prev, [sectionId]: true }));
 
     try {
+      const retrievalStats = {
+        totalIndexed: Math.max(totalIndexedStudies, totalAvailableStudies, evidenceDocuments.length),
+        uniqueIncluded: evidenceDocuments.length,
+        databasesQueried: selectedDatabases
+      };
+
       const res = await fetch('/api/paper-draft/section-action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action,
           sectionTitle: targetSec.title,
+          sectionType: targetSec.type,
           sectionContent: targetSec.content,
+          researchQuestion: draft.researchQuestion || researchQuestion.trim(),
           targetJournal,
           citationStyle,
-          clinicalEvidence: evidenceDocuments
+          clinicalEvidence: evidenceDocuments,
+          retrievalStats
         })
       });
 
@@ -361,7 +381,7 @@ export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
             <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
               Target Evidence Sources:
             </span>
-            {['PubMed', 'DOAJ', 'Google Scholar', 'Scopus', 'OpenAlex'].map(db => {
+            {['PubMed', 'PMC', 'OpenAlex', 'DOAJ', 'Crossref', 'Google Scholar', 'Scopus'].map(db => {
               const active = selectedDatabases.includes(db);
               return (
                 <button
@@ -511,7 +531,7 @@ export const AiPaperWriter: React.FC<AiPaperWriterProps> = ({
                   {draft.targetJournal} Clinical Manuscript
                 </span>
                 <h1 className="text-xl md:text-2xl font-bold text-slate-900 tracking-tight mb-2">
-                  {draft.researchQuestion}
+                  {draft.title || draft.researchQuestion}
                 </h1>
                 <div className="text-xs text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
                   <span><strong>Author:</strong> {draft.author || 'Dr. Puneet Maheshwari'}</span>

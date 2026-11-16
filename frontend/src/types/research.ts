@@ -209,6 +209,14 @@ export interface PaperSection {
 
 export type CitationStyle = 'APA' | 'Chicago' | 'MLA' | 'Vancouver';
 
+export interface GroundingVerificationReport {
+  verifiedCitationsCount: number;
+  autoCorrectedCitations: string[];
+  unverifiedCitationsRemoved: string[];
+  contradictionsFixed: string[];
+  passed: boolean;
+}
+
 export interface PaperDraft {
   id: string;
   title: string;
@@ -222,6 +230,7 @@ export interface PaperDraft {
   date: string;
   sections: PaperSection[];
   totalWords: number;
+  groundingVerification?: GroundingVerificationReport;
 }
 
 export interface OpenRouterModelOption {

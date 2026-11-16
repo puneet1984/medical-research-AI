@@ -412,6 +412,8 @@ export default function App() {
           <AiPaperWriter
             initialQuery={query}
             evidenceDocuments={documents}
+            totalAvailableStudies={totalAvailableStudies}
+            totalIndexedStudies={vectorStatus?.totalIndexed}
           />
         </main>
       )}

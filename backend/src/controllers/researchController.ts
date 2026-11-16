@@ -445,25 +445,54 @@ export async function handleTestConnection(req: Request, res: Response): Promise
 
 export async function handleGeneratePaperDraft(req: Request, res: Response): Promise<void> {
   try {
-    const { researchQuestion, targetJournal, targetDatabases, citationStyle, mode, clinicalEvidence } = req.body;
+    const {
+      researchQuestion,
+      targetJournal,
+      targetDatabases,
+      citationStyle,
+      mode,
+      clinicalEvidence,
+      retrievalStats
+    } = req.body;
 
     if (!researchQuestion || typeof researchQuestion !== 'string' || !researchQuestion.trim()) {
       res.status(400).json({ error: 'researchQuestion is required' });
       return;
     }
 
+    const trimmedQuestion = researchQuestion.trim();
+    const session = sessionStudyRegistry.get(trimmedQuestion.toLowerCase());
+    const resolvedEvidence: MedicalDocument[] =
+      Array.isArray(clinicalEvidence) && clinicalEvidence.length > 0
+        ? clinicalEvidence
+        : (session?.allStudies?.slice(0, 30) || []);
+
+    const vectorStatus = getVectorStatus();
+    const mergedStats = {
+      ...(retrievalStats && typeof retrievalStats === 'object' ? retrievalStats : {}),
+      totalIndexed: Math.max(
+        Number(retrievalStats?.totalIndexed) || 0,
+        session?.allStudies?.length || 0,
+        vectorStatus?.totalIndexed || 0,
+        resolvedEvidence.length
+      ),
+      uniqueIncluded: resolvedEvidence.length
+    };
+
     const draft = await generatePaperDraft({
-      researchQuestion: researchQuestion.trim(),
+      researchQuestion: trimmedQuestion,
       targetJournal,
       targetDatabases,
       citationStyle,
       mode,
-      clinicalEvidence
+      clinicalEvidence: resolvedEvidence,
+      retrievalStats: mergedStats
     });
 
     res.json({
       success: true,
-      draft
+      draft,
+      groundingVerification: draft.groundingVerification
     });
   } catch (err) {
     console.error('[researchController] Paper draft generation error:', err);
@@ -476,26 +505,60 @@ export async function handleGeneratePaperDraft(req: Request, res: Response): Pro
 
 export async function handleSectionAction(req: Request, res: Response): Promise<void> {
   try {
-    const { action, sectionTitle, sectionContent, targetJournal, citationStyle, customPrompt, clinicalEvidence } = req.body;
+    const {
+      action,
+      sectionTitle,
+      sectionType,
+      sectionContent,
+      researchQuestion,
+      targetJournal,
+      citationStyle,
+      customPrompt,
+      clinicalEvidence,
+      retrievalStats
+    } = req.body;
 
     if (!action || !sectionContent) {
       res.status(400).json({ error: 'action and sectionContent are required' });
       return;
     }
 
+    const trimmedQuestion = typeof researchQuestion === 'string' ? researchQuestion.trim() : '';
+    const session = trimmedQuestion ? sessionStudyRegistry.get(trimmedQuestion.toLowerCase()) : undefined;
+    const resolvedEvidence: MedicalDocument[] =
+      Array.isArray(clinicalEvidence) && clinicalEvidence.length > 0
+        ? clinicalEvidence
+        : (session?.allStudies?.slice(0, 30) || []);
+
+    const vectorStatus = getVectorStatus();
+    const mergedStats = {
+      ...(retrievalStats && typeof retrievalStats === 'object' ? retrievalStats : {}),
+      totalIndexed: Math.max(
+        Number(retrievalStats?.totalIndexed) || 0,
+        session?.allStudies?.length || 0,
+        vectorStatus?.totalIndexed || 0,
+        resolvedEvidence.length
+      ),
+      uniqueIncluded: resolvedEvidence.length
+    };
+
     const result = await transformSection({
       action,
       sectionTitle: sectionTitle || 'Clinical Section',
+      sectionType,
       sectionContent,
+      researchQuestion: trimmedQuestion,
       targetJournal,
       citationStyle,
       customPrompt,
-      clinicalEvidence
+      clinicalEvidence: resolvedEvidence,
+      retrievalStats: mergedStats
     });
 
     res.json({
       success: true,
-      result
+      result,
+      groundingVerification: result.groundingVerification
     });
   } catch (err) {
     console.error('[researchController] Section action error:', err);
