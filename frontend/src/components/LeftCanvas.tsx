@@ -32,6 +32,7 @@ interface LeftCanvasProps {
   synthesis: SynthesisData | null;
   expansion: QueryExpansion | null;
   documents: MedicalDocument[];
+  totalAvailableStudies?: number;
   onSelectCitation: (authorOrDoi: string) => void;
   durationMs?: number;
   onGenerateSynthesis?: () => void;
@@ -49,6 +50,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
   synthesis,
   expansion,
   documents,
+  totalAvailableStudies,
   onSelectCitation,
   durationMs,
   onGenerateSynthesis,
@@ -69,24 +71,42 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
     }
   }, [synthesis?.markdown]);
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     const textToCopy = activeView === 'editor' ? editableMarkdown : (synthesis?.markdown || '');
-    navigator.clipboard.writeText(textToCopy);
+    if (!textToCopy) return;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(textToCopy);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = textToCopy;
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownload = () => {
     const textToSave = activeView === 'editor' ? editableMarkdown : (synthesis?.markdown || '');
+    if (!textToSave) return;
     const blob = new Blob([textToSave], { type: 'text/markdown;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
     link.download = `Clinical_Evidence_Report_${new Date().toISOString().split('T')[0]}.md`;
+    link.style.display = 'none';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -474,7 +494,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
           <button
             onClick={handleCopy}
-            disabled={!synthesis?.markdown}
+            disabled={activeView === 'editor' ? !editableMarkdown.trim() : !synthesis?.markdown}
             className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             title="Copy Report to Clipboard"
           >
@@ -483,7 +503,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
 
           <button
             onClick={handleDownload}
-            disabled={!synthesis?.markdown}
+            disabled={activeView === 'editor' ? !editableMarkdown.trim() : !synthesis?.markdown}
             className="flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 p-1.5 rounded hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             title="Download Markdown Report"
           >
@@ -568,7 +588,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                 <div>
                   <h3 className="text-base font-semibold text-slate-900">Medical Evidence Retrieved &amp; Indexed</h3>
                   <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                    MeSH expansion, multi-database search across PubMed, vector indexing, and PICO matrix extraction have completed for <strong className="text-slate-800">{documents.length} studies</strong>.
+                    MeSH expansion, multi-database search across PubMed, vector indexing, and PICO matrix extraction have completed for <strong className="text-slate-800">{(totalAvailableStudies || documents.length).toLocaleString()} retrieved studies</strong>.
                   </p>
                 </div>
 
@@ -579,7 +599,7 @@ export const LeftCanvas: React.FC<LeftCanvasProps> = ({
                   </div>
                   <div className="flex items-center gap-2 font-medium text-slate-700">
                     <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />
-                    <span>{documents.length} publications indexed with clinical PICO matrix</span>
+                    <span>{(totalAvailableStudies || documents.length).toLocaleString()} publications retrieved &amp; indexed with clinical PICO matrix</span>
                   </div>
                   <div className="flex items-center gap-2 font-medium text-slate-700">
                     <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />

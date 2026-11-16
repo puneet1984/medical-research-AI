@@ -147,7 +147,7 @@ export const RightContext: React.FC<RightContextProps> = ({
             <FileText className="w-3.5 h-3.5" />
             <span>Extracted Sources</span>
             <span className="ml-1 text-[10px] px-1.5 py-0.2 bg-slate-100 rounded-full text-slate-600 font-mono">
-              {documents.length}
+              {totalAvailableStudies > documents.length ? `${documents.length}/${totalAvailableStudies}` : (totalAvailableStudies || documents.length)}
             </span>
           </button>
 
@@ -203,6 +203,23 @@ export const RightContext: React.FC<RightContextProps> = ({
                 <span className="font-mono text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-bold">Sub-10ms Hit</span>
               </div>
             ) : null}
+
+            {/* Persistent Total Studies Retrieved Summary */}
+            {(totalAvailableStudies > 0 || documents.length > 0) && (
+              <div className="px-3 py-2 bg-white border border-slate-200 rounded-lg flex items-center justify-between text-xs shadow-2xs">
+                <span className="text-slate-600 font-medium">Total Studies Retrieved</span>
+                <div className="flex items-center gap-2 font-mono">
+                  <span className="font-bold text-teal-700">
+                    {(totalAvailableStudies || documents.length).toLocaleString()} studies
+                  </span>
+                  {documents.length < totalAvailableStudies && (
+                    <span className="text-[11px] text-slate-500">
+                      ({documents.length} shown)
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
 
             {/* Sort Order Selector (Recent to Past is Default) */}
             {documents.length > 0 && (
@@ -352,7 +369,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                       <div className="bg-slate-50 rounded p-1.5 border border-slate-100">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Primary p-Value:</span>
                         <span className="font-mono font-semibold text-teal-700">
-                          {doc.pico.pValues[0] || 'p < 0.001'}
+                          {doc.pico.pValues[0] || 'Not reported'}
                         </span>
                       </div>
                     </div>
@@ -373,7 +390,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                         <div>
                           <span className="text-[11px] font-semibold text-slate-600 uppercase tracking-wider">Abstract:</span>
                           <p className="text-slate-600 text-[11px] leading-relaxed mt-1 bg-slate-50 p-2 rounded border border-slate-200/60 max-h-48 overflow-y-auto">
-                            {doc.abstract}
+                            {doc.abstract || 'Abstract not reported in source metadata.'}
                           </p>
                         </div>
 
@@ -479,12 +496,12 @@ export const RightContext: React.FC<RightContextProps> = ({
                     {isLoadingMore ? (
                       <>
                         <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                        <span>Retrieving &amp; Hydrating Next Studies (+25)...</span>
+                        <span>Retrieving &amp; Hydrating Next Studies (+40)...</span>
                       </>
                     ) : (
                       <>
                         <Layers className="w-3.5 h-3.5" />
-                        <span>Click to Load More Studies (+25) — Retrieve Full Abstracts &amp; PICO</span>
+                        <span>Click to Load More Studies (+40) — Retrieve Full Abstracts &amp; PICO</span>
                       </>
                     )}
                   </button>
@@ -507,7 +524,9 @@ export const RightContext: React.FC<RightContextProps> = ({
                 <p className="text-[11px] text-slate-500">Cross-database extraction from PubMed, DOAJ, Google Scholar, Scopus, and OpenAlex.</p>
               </div>
               <span className="font-mono text-xs font-semibold px-2 py-1 bg-slate-100 rounded text-slate-700">
-                {documents.length} Trials
+                {documents.length < totalAvailableStudies
+                  ? `${documents.length} / ${totalAvailableStudies} Trials`
+                  : `${totalAvailableStudies || documents.length} Retrieved Trials`}
               </span>
             </div>
 
@@ -579,7 +598,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                           </div>
                         )}
                         <span className="font-mono text-[10px] text-teal-800 bg-teal-50 px-1 py-0.5 rounded font-semibold border border-teal-200">
-                          {doc.pico.pValues[0] || 'p < 0.001'}
+                          {doc.pico.pValues[0] || 'Not reported'}
                         </span>
                       </td>
                     </tr>

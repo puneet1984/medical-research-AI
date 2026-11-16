@@ -7,6 +7,7 @@ interface PicoFilterBarProps {
   onFilterChange: (filters: PicoFilters) => void;
   totalCount: number;
   filteredCount: number;
+  totalAvailableStudies?: number;
 }
 
 const STUDY_DESIGNS = [
@@ -36,7 +37,8 @@ export const PicoFilterBar: React.FC<PicoFilterBarProps> = ({
   filters,
   onFilterChange,
   totalCount,
-  filteredCount
+  filteredCount,
+  totalAvailableStudies
 }) => {
   const toggleDesign = (design: string) => {
     const next = filters.designs.includes(design)
@@ -184,7 +186,10 @@ export const PicoFilterBar: React.FC<PicoFilterBarProps> = ({
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2.5">
+          <div className="text-[11px] font-semibold text-teal-800 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded">
+            Total Retrieved: <span className="font-mono font-bold">{(totalAvailableStudies || totalCount).toLocaleString()}</span>
+          </div>
           <div className="text-[11px] text-slate-500">
             Showing <span className="font-semibold text-slate-800">{filteredCount}</span> of <span className="font-semibold text-slate-800">{totalCount}</span> studies
           </div>

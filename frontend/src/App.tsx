@@ -42,6 +42,7 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Pagination & lazy hydration state
+  const [executedQuery, setExecutedQuery] = useState<string>('');
   const [totalAvailableStudies, setTotalAvailableStudies] = useState<number>(0);
   const [hasMore, setHasMore] = useState<boolean>(false);
   const [nextOffset, setNextOffset] = useState<number>(0);
@@ -106,7 +107,7 @@ export default function App() {
       const res = await fetch('/api/search-and-index', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: q, filters, limit: 28 })
+        body: JSON.stringify({ query: q, filters, limit: 0, retrieveAll: true })
       });
 
       if (!res.ok) {
@@ -114,8 +115,9 @@ export default function App() {
       }
 
       const data = await res.json();
+      setExecutedQuery((data.query || q).trim());
       setDocuments(data.documents || []);
-      setTotalAvailableStudies(data.totalAvailableStudies || (data.documents?.length || 0));
+      setTotalAvailableStudies(data.totalAvailableStudies || data.totalRetrievedStudies || (data.documents?.length || 0));
       setHasMore(Boolean(data.hasMore));
       setNextOffset(data.nextOffset || (data.documents?.length || 0));
       setSynthesis(data.synthesis || null);
@@ -357,66 +359,66 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Area */}
-      {activeTab === 'workspace' ? (
-        <>
-          {/* 2. PICO Metadata Controls Filter Bar */}
-          <PicoFilterBar
-            filters={filters}
-            onFilterChange={setFilters}
-            totalCount={documents.length}
-            filteredCount={filteredDocuments.length}
-          />
+      {/* Main Content Area: Keep both views mounted so tab switching preserves AI Editor content */}
+      <div className={activeTab === 'workspace' ? 'flex-1 flex flex-col overflow-hidden' : 'hidden'}>
+        {/* 2. PICO Metadata Controls Filter Bar */}
+        <PicoFilterBar
+          filters={filters}
+          onFilterChange={setFilters}
+          totalCount={documents.length}
+          filteredCount={filteredDocuments.length}
+          totalAvailableStudies={totalAvailableStudies}
+        />
 
-          {/* 3. Main Split-Screen Workspace (60% / 40% Dual-Pane) */}
-          <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
-            {/* Left Canvas: Synthesis Workspace & Editor (60% width) */}
-            <div className="w-full md:w-[60%] h-full flex flex-col overflow-hidden">
-              <LeftCanvas
-                query={query}
-                onQueryChange={setQuery}
-                onExecuteSearch={executeSearch}
-                isLoading={isLoading}
-                activeStep={activeStep}
-                synthesis={synthesis}
-                expansion={expansion}
-                documents={filteredDocuments}
-                onSelectCitation={handleSelectCitation}
-                durationMs={durationMs}
-                onGenerateSynthesis={handleGenerateSynthesis}
-                isSynthesizing={isSynthesizing}
-                activeSynthesisModel={activeSettings?.llmSynthesisModel}
-                activeReasoningModel={activeSettings?.llmReasoningModel}
-              />
-            </div>
+        {/* 3. Main Split-Screen Workspace (60% / 40% Dual-Pane) */}
+        <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
+          {/* Left Canvas: Synthesis Workspace & Editor (60% width) */}
+          <div className="w-full md:w-[60%] h-full flex flex-col overflow-hidden">
+            <LeftCanvas
+              query={query}
+              onQueryChange={setQuery}
+              onExecuteSearch={executeSearch}
+              isLoading={isLoading}
+              activeStep={activeStep}
+              synthesis={synthesis}
+              expansion={expansion}
+              documents={filteredDocuments}
+              totalAvailableStudies={totalAvailableStudies}
+              onSelectCitation={handleSelectCitation}
+              durationMs={durationMs}
+              onGenerateSynthesis={handleGenerateSynthesis}
+              isSynthesizing={isSynthesizing}
+              activeSynthesisModel={activeSettings?.llmSynthesisModel}
+              activeReasoningModel={activeSettings?.llmReasoningModel}
+            />
+          </div>
 
-            {/* Right Context: Document Viewer & Source Tabs (40% width) */}
-            <div className="w-full md:w-[40%] h-full flex flex-col overflow-hidden">
-              <RightContext
-                documents={filteredDocuments}
-                activeDocumentId={activeDocumentId}
-                onSelectDocument={setActiveDocumentId}
-                vectorStatus={vectorStatus}
-                isLoading={isLoading}
-                totalAvailableStudies={totalAvailableStudies}
-                hasMore={hasMore}
-                isLoadingMore={isLoadingMore}
-                onLoadMore={handleLoadMore}
-              />
-            </div>
-          </main>
-        </>
-      ) : (
-        /* AI Editor & Writer View */
-        <main className="flex-1 overflow-hidden">
-          <AiPaperWriter
-            initialQuery={query}
-            evidenceDocuments={documents}
-            totalAvailableStudies={totalAvailableStudies}
-            totalIndexedStudies={vectorStatus?.totalIndexed}
-          />
+          {/* Right Context: Document Viewer & Source Tabs (40% width) */}
+          <div className="w-full md:w-[40%] h-full flex flex-col overflow-hidden">
+            <RightContext
+              documents={filteredDocuments}
+              activeDocumentId={activeDocumentId}
+              onSelectDocument={setActiveDocumentId}
+              vectorStatus={vectorStatus}
+              isLoading={isLoading}
+              totalAvailableStudies={totalAvailableStudies}
+              hasMore={hasMore}
+              isLoadingMore={isLoadingMore}
+              onLoadMore={handleLoadMore}
+            />
+          </div>
         </main>
-      )}
+      </div>
+
+      <main className={activeTab === 'writer' ? 'flex-1 flex flex-col overflow-hidden' : 'hidden'}>
+        <AiPaperWriter
+          initialQuery={executedQuery || query}
+          executedQuery={executedQuery}
+          evidenceDocuments={documents}
+          totalAvailableStudies={totalAvailableStudies}
+          totalIndexedStudies={vectorStatus?.totalIndexed}
+        />
+      </main>
 
       {/* Settings Modal */}
       <SettingsModal

@@ -2,6 +2,11 @@ import { executeInference } from '../services/openRouterService.js';
 import { MedicalDocument } from '../services/searchService.js';
 import { config } from '../config.js';
 import { humanizeMedicalProse } from '../services/paperDraftService.js';
+import {
+  pluralizeStudyDesign,
+  sanitizeDocumentMetadata,
+  rankAndFilterStudiesForQuestion
+} from '../services/corpusContextBuilder.js';
 
 export interface SynthesisResult {
   markdown: string;
@@ -14,49 +19,57 @@ export interface SynthesisResult {
  * Builds deterministic clinical synthesis when AI model is offline
  */
 function buildDeterministicSynthesis(query: string, docs: MedicalDocument[]): string {
-  const topDocs = docs.slice(0, 6);
-  const citations = topDocs.map(d => `[${d.firstAuthor}, ${d.year} (${d.doi || 'DOI'})]`);
+  const topDocs = docs.slice(0, 6).map(sanitizeDocumentMetadata);
+  const citations = topDocs.map(d => `[${d.firstAuthor}, ${d.year} (${d.pmid ? `PMID:${d.pmid}` : (d.doi || d.id)})]`);
+
+  const validSampleSizes = topDocs
+    .map(d => d.pico.sampleSize)
+    .filter((n): n is number => typeof n === 'number' && n > 0);
+  const sampleBoundaryText = validSampleSizes.length > 0
+    ? `N = ${Math.min(...validSampleSizes).toLocaleString()} to N = ${Math.max(...validSampleSizes).toLocaleString()} patients`
+    : 'Not reported in the retrieved studies';
+
+  const designCounts: Record<string, number> = {};
+  for (const d of topDocs) {
+    const design = d.pico.design || 'Clinical Trial';
+    designCounts[design] = (designCounts[design] || 0) + 1;
+  }
+  const designDistributionText = Object.entries(designCounts)
+    .map(([design, count]) => `${count} ${pluralizeStudyDesign(design, count)}`)
+    .join(', ') || '0 studies';
 
   return `### Executive Clinical Summary
-Based on multi-database vector retrieval of ${docs.length} peer-reviewed clinical studies, the therapeutic evidence regarding **"${query}"** demonstrates robust statistical efficacy with consistent improvements across primary composite endpoints.
+Based on multi-database retrieval of ${docs.length} peer-reviewed clinical studies, evidence regarding **"${query}"** was evaluated across retrieved primary cohorts and clinical endpoints.
 
 ---
 
 ### PICO Evidence Breakdown
 
 #### 👥 1. Population (P)
-- **Cohort Profile:** Studied populations primarily comprise multicenter clinical cohorts across diverse baseline demographics.
-- **Sample Enrolled:** Aggregated participant boundaries span from N = ${Math.min(...topDocs.map(d => d.pico.sampleSize || 500)).toLocaleString()} to N = ${Math.max(...topDocs.map(d => d.pico.sampleSize || 4500)).toLocaleString()} patients.
-- **Key Evidence:** ${topDocs[0]?.pico.population || 'Adult patients with documented clinical indications'} ${citations[0] || ''}.
+- **Cohort Profile:** Studied populations strictly reflect retrieved clinical cohorts matching the search query.
+- **Sample Enrolled:** Reported participant boundaries span ${sampleBoundaryText}.
+- **Key Evidence:** ${topDocs[0]?.pico.population && topDocs[0].pico.population !== 'Not reported' ? topDocs[0].pico.population : 'Not reported in the retrieved studies'} ${citations[0] || ''}.
 
 #### 💊 2. Intervention & Regimens (I)
-- **Active Regimen:** Evaluated therapeutic regimens focus on ${topDocs[0]?.pico.intervention || query} ${citations[0] || ''}.
-- **Dosing Protocols:** Investigated protocols adhere to guideline-recommended titrated dosages administered in randomized phases ${citations[1] || citations[0] || ''}.
+- **Active Regimen:** Evaluated therapeutic regimens focus on ${topDocs[0]?.pico.intervention && topDocs[0].pico.intervention !== 'Not reported' ? topDocs[0].pico.intervention : 'Not reported in the retrieved studies'} ${citations[0] || ''}.
 
 #### ⚖️ 3. Comparator (C)
-- **Control Arm:** Compared against standard-of-care baseline medical therapy and matching placebo control groups ${citations[0] || ''}.
+- **Control Arm:** ${topDocs[0]?.pico.comparator && topDocs[0].pico.comparator !== 'Not reported' ? topDocs[0].pico.comparator : 'Not reported in the retrieved studies'} ${citations[0] || ''}.
 
 #### 🎯 4. Outcomes & Effect Sizes (O)
-- **Primary Clinical Endpoints:** Significant reductions in composite events, cardiovascular morbidity, or progression metrics.
 - **Statistical Significance:**
-${topDocs.map(d => `  - **${d.firstAuthor} et al. (${d.year}):** ${d.pico.primaryOutcome} — ${d.pico.hazardRatio ? `Hazard Ratio: \`${d.pico.hazardRatio}\`, ` : ''}\`${d.pico.pValues.join(', ') || 'p < 0.001'}\` [${d.firstAuthor}, ${d.year} (${d.doi})].`).join('\n')}
+${topDocs.map((d, i) => `  - **${d.firstAuthor} et al. (${d.year}):** ${d.pico.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'Primary outcome not reported'} — ${d.pico.hazardRatio ? `Hazard Ratio: \`${d.pico.hazardRatio}\`, ` : ''}\`${d.pico.pValues.length > 0 ? d.pico.pValues.join(', ') : 'p-value: Not reported'}\` ${citations[i] || ''}.`).join('\n')}
 
 ---
 
 ### Study Design Hierarchy & Risk of Bias
-- **Design Distribution:** Comprises ${topDocs.filter(d => d.pico.design === 'Randomized Controlled Trial').length} Randomized Controlled Trials, ${topDocs.filter(d => d.pico.design === 'Meta-Analysis').length} Meta-Analyses, ${topDocs.filter(d => d.pico.design === 'Systematic Review').length} Systematic Reviews, ${topDocs.filter(d => d.pico.design === 'Cohort Study').length} Cohort Studies, and ${topDocs.filter(d => d.pico.design === 'Case Report' || d.pico.design === 'Case Series').length} Case Reports/Series.
-- **Quality Tiering:** High methodological consistency across peer-reviewed clinical protocols with evidence grading based on Oxford CEBM criteria.
-
----
-
-### Clinical Takeaways & Evidence Gaps
-1. **First-Line Adoption:** Current randomized evidence strongly supports incorporation into clinical care pathways for eligible patient subsets.
-2. **Subgroup Heterogeneity:** Continued longitudinal monitoring is recommended for long-term safety profiles beyond 36 months.
+- **Design Distribution:** Comprises ${designDistributionText}.
+- **Quality Tiering:** Methodological quality reflects the retrieved study designs listed above.
 
 ---
 
 ### Cited Clinical Trials & Literature
-${topDocs.map((d, i) => `${i + 1}. **${d.firstAuthor} et al. (${d.year})** — *${d.title}*. **${d.journal}**. DOI: [${d.doi}](https://doi.org/${d.doi}) | PMID: \`${d.pmid || 'N/A'}\``).join('\n')}
+${topDocs.map((d, i) => `${i + 1}. **${d.firstAuthor} et al. (${d.year})** — *${d.title}*. **${d.journal}**. ${d.doi ? `DOI: [${d.doi}](https://doi.org/${d.doi}) | ` : ''}PMID: \`${d.pmid || 'N/A'}\``).join('\n')}
 `;
 }
 
@@ -76,9 +89,12 @@ export async function synthesizeLiterature(
     };
   }
 
+  const rankedDocs = rankAndFilterStudiesForQuestion(documents, query).relevantStudies;
+  const activeDocs = rankedDocs.length > 0 ? rankedDocs : documents.map(sanitizeDocumentMetadata);
+
   // Format context for prompt with explicit citation keys
-  const contextFormatted = documents.slice(0, 8).map((doc, idx) => {
-    const citationKey = `[${doc.firstAuthor}, ${doc.year} (${doc.doi || 'DOI'})]`;
+  const contextFormatted = activeDocs.slice(0, 8).map((doc, idx) => {
+    const citationKey = `[${doc.firstAuthor}, ${doc.year} (${doc.pmid ? `PMID:${doc.pmid}` : (doc.doi || doc.id)})]`;
     const fullTextExcerpt = doc.hasFullText && doc.fullText
       ? `\n- PMC Open-Access Full-Text Excerpt (${doc.pmcid || 'PMC'}):\n${doc.fullText.slice(0, 3500)}`
       : '';
@@ -86,14 +102,14 @@ export async function synthesizeLiterature(
 - Title: ${doc.title}
 - Authors: ${doc.authors.slice(0, 5).join(', ')} et al.
 - Journal: ${doc.journal} (${doc.year})
-- DOI: ${doc.doi}${doc.pmid ? ` | PMID: ${doc.pmid}` : ''}${doc.pmcid ? ` | PMCID: ${doc.pmcid}` : ''}
+- DOI: ${doc.doi || 'N/A'}${doc.pmid ? ` | PMID: ${doc.pmid}` : ''}${doc.pmcid ? ` | PMCID: ${doc.pmcid}` : ''}
 - Study Design: ${doc.pico.design}
-- Population (N): ${doc.pico.population} (N = ${doc.pico.sampleSize})
+- Population (N): ${doc.pico.population} (N = ${doc.pico.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'})
 - Intervention: ${doc.pico.intervention}
 - Comparator: ${doc.pico.comparator}
 - Outcome: ${doc.pico.primaryOutcome}
-- Quantitative Metrics: ${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.riskRatio ? `RR: ${doc.pico.riskRatio}, ` : ''}${doc.pico.pValues.join(', ')}
-- Abstract: ${doc.abstract}${fullTextExcerpt}
+- Quantitative Metrics: ${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.riskRatio ? `RR: ${doc.pico.riskRatio}, ` : ''}${doc.pico.pValues.length > 0 ? doc.pico.pValues.join(', ') : 'p-value: Not reported'}
+- Abstract: ${doc.abstract || 'Not reported in source metadata.'}${fullTextExcerpt}
 `;
   }).join('\n---\n');
 
@@ -148,7 +164,7 @@ Please produce a comprehensive, structured PICO clinical synthesis report for th
     console.warn('[synthesisAgent] Inference synthesis note, using structured clinical builder:', err instanceof Error ? err.message : err);
   }
 
-  const fallbackMarkdown = humanizeMedicalProse(buildDeterministicSynthesis(query, documents));
+  const fallbackMarkdown = humanizeMedicalProse(buildDeterministicSynthesis(query, activeDocs));
   const citationMatches = fallbackMarkdown.match(/\[[A-Za-z\s–-]+,\s*\d{4}\s*\([^)]+\)\]/g) || [];
 
   return {

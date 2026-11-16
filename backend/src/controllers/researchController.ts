@@ -19,7 +19,7 @@ const sessionStudyRegistry = new Map<string, SessionQueryStudies>();
 export async function handleSearchAndIndex(req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
   try {
-    const { query, filters, limit = 40 } = req.body;
+    const { query, filters, limit = 0, retrieveAll = true } = req.body;
 
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       res.status(400).json({ error: 'Query string is required' });
@@ -27,17 +27,18 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     }
 
     const trimmedQuery = query.trim();
-    const searchLimit = Math.max(15, Number(limit) || 40);
+    const shouldRetrieveAll = retrieveAll !== false && (!limit || Number(limit) <= 0);
+    const searchLimit = shouldRetrieveAll ? 500 : Math.max(15, Number(limit) || 200);
 
     // 0. Vector Cache Check: Rapid pre-indexed vector lookup with high similarity threshold (0.78)
-    const rawCachedHits = await findCachedSimilar(trimmedQuery, 0.78, searchLimit);
+    const rawCachedHits = await findCachedSimilar(trimmedQuery, 0.78, Math.min(searchLimit, 200));
     const cachedVectorHits = filterAndRankByClinicalRelevance(rawCachedHits.map(c => c.document), trimmedQuery);
 
     // 1. Agentic Step 1: Dynamic Query Expansion (NLM MetaMap & LLM)
     const expansion = await expandQuery(trimmedQuery);
 
     // 2. Agentic Step 2: Multi-Database Bulk Retrieval across PubMed, OpenAlex, Crossref, DOAJ
-    const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(trimmedQuery, 160, 0);
+    const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(trimmedQuery, 500, 0);
 
     // Combine cached vector studies with live fetched documents, deduplicating by DOI/PMID/Title
     const seenMap = new Map<string, MedicalDocument>();
@@ -81,15 +82,14 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
 
     const availablePool = filteredDocuments.length > 0 ? filteredDocuments : combinedPool;
 
-    // Show initial batch (e.g. 28-30 studies)
-    const initialBatch = availablePool.slice(0, searchLimit);
+    // Return all available studies when retrieveAll is active, otherwise slice to requested limit
+    const initialBatch = shouldRetrieveAll ? availablePool : availablePool.slice(0, searchLimit);
 
     // 3. Agentic Step 3: Vector Embedding & Persistent Storage with Rolling FIFO checks
     const upsertResult = await upsertDocuments(initialBatch);
 
     // 4. Agentic Step 4: Semantic Vector Ranking
-    const rankedResults = await searchSimilar(trimmedQuery, searchLimit);
-    const rankedDocIds = new Set(rankedResults.map(r => r.document.id));
+    const rankedResults = await searchSimilar(trimmedQuery, Math.max(initialBatch.length, 40));
 
     // Ensure all items in initialBatch have similarity scores and remain ordered recent to past
     const finalDocuments: MedicalDocument[] = initialBatch.map(doc => {
@@ -112,13 +112,15 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     const synthesis = null;
 
     const durationMs = Date.now() - startTime;
+    const totalRetrieved = Math.max(availablePool.length, totalAvailable);
 
     res.json({
       success: true,
       query: trimmedQuery,
       expansion,
       documents: finalDocuments,
-      totalAvailableStudies: availablePool.length,
+      totalAvailableStudies: totalRetrieved,
+      totalRetrievedStudies: totalRetrieved,
       currentOffset: finalDocuments.length,
       hasMore: availablePool.length > finalDocuments.length,
       nextOffset: finalDocuments.length,
@@ -465,7 +467,7 @@ export async function handleGeneratePaperDraft(req: Request, res: Response): Pro
     const resolvedEvidence: MedicalDocument[] =
       Array.isArray(clinicalEvidence) && clinicalEvidence.length > 0
         ? clinicalEvidence
-        : (session?.allStudies?.slice(0, 30) || []);
+        : (session?.allStudies || []);
 
     const vectorStatus = getVectorStatus();
     const mergedStats = {
@@ -528,7 +530,7 @@ export async function handleSectionAction(req: Request, res: Response): Promise<
     const resolvedEvidence: MedicalDocument[] =
       Array.isArray(clinicalEvidence) && clinicalEvidence.length > 0
         ? clinicalEvidence
-        : (session?.allStudies?.slice(0, 30) || []);
+        : (session?.allStudies || []);
 
     const vectorStatus = getVectorStatus();
     const mergedStats = {
@@ -581,7 +583,7 @@ export async function handleSynthesizeReport(req: Request, res: Response): Promi
     const trimmedQuery = query.trim();
     const candidateDocs: MedicalDocument[] = Array.isArray(documents) && documents.length > 0
       ? documents
-      : (sessionStudyRegistry.get(trimmedQuery.toLowerCase())?.allStudies?.slice(0, 30) || []);
+      : (sessionStudyRegistry.get(trimmedQuery.toLowerCase())?.allStudies || []);
 
     if (candidateDocs.length === 0) {
       res.status(400).json({ error: 'No clinical documents available to synthesize. Please search literature first.' });

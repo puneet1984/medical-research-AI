@@ -1,6 +1,19 @@
 import { executeInference } from './openRouterService.js';
 import { MedicalDocument } from './searchService.js';
 import { config } from '../config.js';
+import {
+  RetrievalStatsMetadata,
+  pluralizeStudyDesign,
+  decodeHtmlEntities,
+  sanitizeDocumentMetadata,
+  rankAndFilterStudiesForQuestion,
+  buildRetrievalStats,
+  buildCorpusContext,
+  formatCanonicalCitation
+} from './corpusContextBuilder.js';
+
+export type { RetrievalStatsMetadata };
+export { formatCanonicalCitation, buildRetrievalStats };
 
 export interface PaperSection {
   id: string;
@@ -9,16 +22,6 @@ export interface PaperSection {
   content: string;
   keyPoints?: string[];
   wordCount?: number;
-}
-
-export interface RetrievalStatsMetadata {
-  totalIndexed: number;
-  uniqueIncluded: number;
-  pmcFullTextCount: number;
-  databasesQueried: string[];
-  databaseBreakdown: Record<string, number>;
-  studyDesignCounts: Record<string, number>;
-  studyDesigns: string[];
 }
 
 export interface GroundingVerificationReport {
@@ -70,12 +73,13 @@ export interface SectionActionRequest {
 
 /**
  * Post-processes text to strictly enforce medical journal typography:
+ * - Decodes HTML entities (&gt;, &lt;, &amp;, &quot;, etc.)
  * - Strips LaTeX dollar math delimiters ($p < 0.05$ -> p < 0.05, $N = 250$ -> N = 250)
  * - Humanizes robotic/agentic phrasing ('were synthesized' -> 'were critically evaluated and analyzed')
  */
 export function humanizeMedicalProse(text: string): string {
   if (!text) return '';
-  return text
+  return decodeHtmlEntities(text)
     .replace(/\$\s*([pPnN])\s*([<>=]|&lt;|&gt;)\s*([0-9.]+)\s*\$/g, '$1 $2 $3')
     .replace(/\$\s*([pPnN])\s*\$/g, '$1')
     .replace(/\$\s*([0-9.]+)\s*\$/g, '$1')
@@ -92,155 +96,6 @@ export function humanizeMedicalProse(text: string): string {
     .replace(/\bevidence synthesis\b/gi, 'clinical evidence evaluation');
 }
 
-/**
- * Formats canonical inline citation tag: [Author, Year (PMID/DOI)]
- */
-export function formatCanonicalCitation(doc: MedicalDocument): string {
-  const authorSurname = (doc.firstAuthor || 'Investigator').split(/\s+/)[0] || 'Investigator';
-  const idPart = doc.pmid ? `PMID:${doc.pmid}` : (doc.doi || doc.id);
-  return `[${authorSurname}, ${doc.year} (${idPart})]`;
-}
-
-/**
- * Computes exact retrieval statistics, database hit counts, and study design distribution
- * from the active `clinicalEvidence` pool and caller metadata.
- */
-export function buildRetrievalStats(
-  clinicalEvidence: MedicalDocument[],
-  targetDatabases: string[],
-  overrideStats?: Partial<RetrievalStatsMetadata>
-): RetrievalStatsMetadata {
-  const databaseBreakdown: Record<string, number> = {};
-  const studyDesignCounts: Record<string, number> = {};
-  let pmcFullTextCount = 0;
-
-  for (const doc of clinicalEvidence) {
-    const src = doc.source || 'PubMed';
-    databaseBreakdown[src] = (databaseBreakdown[src] || 0) + 1;
-    if (doc.pmcid || doc.hasFullText) {
-      pmcFullTextCount += doc.hasFullText ? 1 : 0;
-    }
-    const design = doc.pico?.design || 'Clinical Trial';
-    studyDesignCounts[design] = (studyDesignCounts[design] || 0) + 1;
-  }
-
-  if (pmcFullTextCount > 0 || databaseBreakdown['PubMed']) {
-    databaseBreakdown['PMC (Open-Access Full Text)'] = pmcFullTextCount;
-  }
-
-  const baseDatabases = targetDatabases.length > 0
-    ? targetDatabases
-    : ['PubMed/NCBI Entrez', 'PMC', 'OpenAlex', 'DOAJ', 'Crossref'];
-
-  // Ensure standard queried databases are accurately represented
-  const normalizedDbSet = new Set<string>(baseDatabases);
-  if (normalizedDbSet.has('PubMed')) {
-    normalizedDbSet.delete('PubMed');
-    normalizedDbSet.add('PubMed/NCBI Entrez');
-    normalizedDbSet.add('PMC');
-  }
-  if (!normalizedDbSet.has('Crossref')) normalizedDbSet.add('Crossref');
-  if (!normalizedDbSet.has('OpenAlex')) normalizedDbSet.add('OpenAlex');
-  if (!normalizedDbSet.has('DOAJ')) normalizedDbSet.add('DOAJ');
-
-  const uniqueIncluded = overrideStats?.uniqueIncluded ?? clinicalEvidence.length;
-  const totalIndexed = Math.max(uniqueIncluded, overrideStats?.totalIndexed ?? clinicalEvidence.length);
-
-  return {
-    totalIndexed,
-    uniqueIncluded,
-    pmcFullTextCount,
-    databasesQueried: Array.from(normalizedDbSet),
-    databaseBreakdown: overrideStats?.databaseBreakdown && Object.keys(overrideStats.databaseBreakdown).length > 0
-      ? overrideStats.databaseBreakdown
-      : databaseBreakdown,
-    studyDesignCounts: overrideStats?.studyDesignCounts && Object.keys(overrideStats.studyDesignCounts).length > 0
-      ? overrideStats.studyDesignCounts
-      : studyDesignCounts,
-    studyDesigns: Object.keys(studyDesignCounts)
-  };
-}
-
-/**
- * Builds structured `PICO_MATRIX` JSON and full `CONTEXT_SOURCES` (including PMC full-text
- * `methods`, `results`, `tables`, and `discussion` sections when available).
- */
-export function buildGroundedEvidenceContext(
-  clinicalEvidence: MedicalDocument[],
-  stats: RetrievalStatsMetadata,
-  maxDocsInContext = 15
-): { picoMatrixJson: string; contextSourcesText: string; statsMetadataText: string } {
-  const includedDocs = clinicalEvidence.slice(0, maxDocsInContext);
-
-  const picoMatrix = includedDocs.map((doc, idx) => ({
-    sourceIndex: idx + 1,
-    canonicalCitation: formatCanonicalCitation(doc),
-    firstAuthor: doc.firstAuthor,
-    authors: doc.authors.slice(0, 6),
-    title: doc.title,
-    journal: doc.journal,
-    year: doc.year,
-    pmid: doc.pmid || null,
-    pmcid: doc.pmcid || null,
-    doi: doc.doi,
-    sourceDatabase: doc.source,
-    hasPmcFullText: Boolean(doc.hasFullText),
-    design: doc.pico?.design || 'Clinical Trial',
-    population: doc.pico?.population || 'Not reported in the retrieved studies',
-    sampleSizeN: typeof doc.pico?.sampleSize === 'number' && doc.pico.sampleSize > 0
-      ? doc.pico.sampleSize
-      : 'Not reported in the retrieved studies',
-    intervention: doc.pico?.intervention || 'Not reported in the retrieved studies',
-    comparator: doc.pico?.comparator || 'Not reported in the retrieved studies',
-    primaryOutcome: doc.pico?.primaryOutcome || 'Not reported in the retrieved studies',
-    hazardRatio: doc.pico?.hazardRatio || 'Not reported in the retrieved studies',
-    riskRatio: doc.pico?.riskRatio || 'Not reported in the retrieved studies',
-    pValues: Array.isArray(doc.pico?.pValues) && doc.pico.pValues.length > 0
-      ? doc.pico.pValues
-      : ['Not reported in the retrieved studies']
-  }));
-
-  const contextSourcesText = includedDocs.map((doc, idx) => {
-    const citationKey = formatCanonicalCitation(doc);
-    const lines: string[] = [
-      `[SOURCE ${idx + 1}] ${citationKey}`,
-      `Authors: ${doc.authors.slice(0, 8).join(', ') || doc.firstAuthor}`,
-      `Title: ${doc.title}`,
-      `Journal: ${doc.journal} (${doc.year}) | Source DB: ${doc.source} | PMID: ${doc.pmid || 'N/A'} | PMCID: ${doc.pmcid || 'N/A'} | DOI: ${doc.doi}`,
-      `Study Design: ${doc.pico?.design || 'Clinical Trial'} | Sample Size N: ${doc.pico?.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported in the retrieved studies'}`,
-      `AbstractText: ${doc.abstract || 'Not reported in the retrieved studies'}`
-    ];
-
-    if (doc.hasFullText && doc.fullTextSections) {
-      const { methods, results, tables, discussion } = doc.fullTextSections;
-      if (methods) lines.push(`PMC_METHODS: ${methods.slice(0, 1200)}`);
-      if (results) lines.push(`PMC_RESULTS: ${results.slice(0, 1400)}`);
-      if (tables) lines.push(`PMC_TABLES: ${tables.slice(0, 1000)}`);
-      if (discussion) lines.push(`PMC_DISCUSSION: ${discussion.slice(0, 900)}`);
-    } else if (doc.hasFullText && doc.fullText) {
-      lines.push(`PMC_FULL_TEXT_EXCERPT: ${doc.fullText.slice(0, 2200)}`);
-    }
-
-    return lines.join('\n');
-  }).join('\n\n---\n\n');
-
-  const statsMetadataText = JSON.stringify({
-    databasesQueried: stats.databasesQueried,
-    totalIndexedRecords: stats.totalIndexed,
-    uniqueStudiesIncluded: stats.uniqueIncluded,
-    pmcOpenAccessFullTextArticles: stats.pmcFullTextCount,
-    databaseHitCounts: stats.databaseBreakdown,
-    studyDesignCounts: stats.studyDesignCounts,
-    studyDesignsPresent: stats.studyDesigns
-  }, null, 2);
-
-  return {
-    picoMatrixJson: JSON.stringify(picoMatrix, null, 2),
-    contextSourcesText: contextSourcesText || 'NO RETRIEVED STUDIES AVAILABLE. Explicitly write "Not reported in the retrieved studies" for empirical figures and avoid fabricating citations.',
-    statsMetadataText
-  };
-}
-
 const GLOBAL_CLINICAL_GROUNDING_RULES = `STRICT CLINICAL GROUNDING RULES (APPLY TO EVERY SECTION & INLINE ACTION):
 1. Closed-World Evidence Boundary: Use ONLY facts, numbers, mechanisms, and conclusions explicitly present in the retrieved CONTEXT_SOURCES and PICO_MATRIX. Never rely on pre-trained parametric assumptions to fill missing data.
 2. Mandatory Inline Citations: Every clinical claim, sample size (N), outcome metric (HR, RR, OR, MD, 95% CI, p-value), and mechanism MUST be immediately followed by an exact citation tag matching CONTEXT_SOURCES in the format [Author, Year (PMID/DOI)]. Never cite a source ID not present in CONTEXT_SOURCES.
@@ -249,48 +104,109 @@ const GLOBAL_CLINICAL_GROUNDING_RULES = `STRICT CLINICAL GROUNDING RULES (APPLY 
 
 const SECTION_SPECIFIC_GROUNDING_RULES = `IMRaD SECTION-BY-SECTION CLINICAL GROUNDING RULES:
 - Title & Abstract:
-  * Accurately reflect the exact study designs retrieved (e.g., "Systematic Evidence Synthesis of Randomized Controlled Trials and Cohort Studies...").
+  * Accurately reflect the exact study designs retrieved with proper pluralization (e.g., "Cohort Studies", "Meta-Analyses", "Case Series", "Randomized Controlled Trials").
   * Do NOT claim "superiority" unless pooled meta-analytic metrics in CONTEXT_SOURCES prove statistical superiority; otherwise use "comparative effectiveness" or "non-inferiority."
 - 1. Introduction:
   * Frame the clinical gap strictly around the user's PICO question (Population, Intervention, Comparator, Outcome).
   * Do NOT invent epidemiological prevalence numbers unless explicitly cited from CONTEXT_SOURCES.
 - 2. Methods (Search & Synthesis Protocol):
-  * State the exact databases queried (PubMed/NCBI Entrez, PMC, OpenAlex, DOAJ, Crossref) and exact retrieval counts (Total Indexed Records vs. Unique Studies Included) passed in RETRIEVAL_METADATA.
+  * State ONLY the exact databases actually queried in RETRIEVAL_METADATA (databasesQueried) and exact primary retrieval counts (primarySourceCountsSummingToUnique, summing strictly to uniqueRelevantStudiesIncluded).
+  * Report PMC open-access full-text retrievals strictly as an enrichment subset of PubMed rather than an additive database count.
   * Do NOT fabricate PRISMA screening numbers or bias-assessment scores (e.g., Cochrane RoB 2) unless explicitly present in backend metadata.
 - 3. Results & Clinical Evidence Evaluation:
-  * 3.1 Study Selection: List exact study counts broken down by actual study design metadata from RETRIEVAL_METADATA (e.g., X RCTs, Y Cohort Studies).
-  * Biological & Pharmacological Mechanisms: Report ONLY mechanisms explicitly stated in the retrieved PMC_METHODS, PMC_RESULTS, PMC_DISCUSSION, or AbstractText. Never fabricate pharmacokinetic claims (e.g., onset speed, bioavailability, or tissue localization). If absent, explicitly write "Not reported in the retrieved studies."
-  * Quantitative Statistical Metrics: Quote exact values (N, HR, RR, 95% CI, p-values) verbatim from PICO_MATRIX and PMC_TABLES with inline citations [Author, Year (PMID/DOI)] for every single figure.
+  * 3.1 Study Selection: List exact study counts broken down by actual study design metadata from RETRIEVAL_METADATA using proper pluralization (e.g., X Randomized Controlled Trials, Y Cohort Studies, Z Meta-Analyses).
+  * 3.2 Biological & Pharmacological Mechanisms: Report ONLY mechanisms explicitly stated in the retrieved PMC_METHODS, PMC_RESULTS, PMC_DISCUSSION, or AbstractText. Never fabricate pharmacokinetic claims (e.g., onset speed, bioavailability, or tissue localization). If absent, explicitly write "Not reported in the retrieved studies."
+  * 3.3 Quantitative Statistical Metrics: Quote exact values (N, HR, RR, 95% CI, p-values) verbatim from PICO_MATRIX and PMC_TABLES with inline citations [Author, Year (PMID/DOI)] for every single figure.
 - 4. Discussion & Limitations:
-  * Discussion: Compare findings across included studies and highlight concordant or conflicting outcomes with inline citations.
+  * Discussion: Compare findings across included studies relevant to the clinical target and highlight concordant or conflicting outcomes with inline citations.
   * Limitations: Derive limitations strictly from the actual study designs and sample sizes in PICO_MATRIX (e.g., small sample sizes N < 100, short follow-up duration, or heterogeneity across cohorts). NEVER call an RCT cohort "observational" or suggest "future RCTs are needed" if Randomized Controlled Trials are already present in studyDesignsPresent without explaining why.
 - 5. Conclusion:
   * Restrict conclusions strictly to the population and outcomes evaluated in Results. Avoid sweeping clinical practice recommendations unless supported by Grade-A guidelines or multi-center RCTs in CONTEXT_SOURCES.
 - 6. References:
-  * Render ONLY the exact sources cited in the text, formatted strictly in the selected citation standard (Vancouver, APA 7th, Chicago 17th, or MLA 9th) using verified metadata (Authors, Title, Journal, Year, PMID, DOI).`;
+  * Put "[Compiled deterministically by reference engine]" as the placeholder content for sec-references; the backend reference engine compiles Section 6 deterministically from inline citations in Sections 1-5.`;
 
 /**
- * Formats a single reference entry strictly in the chosen citation style using verified metadata.
+ * Formats a single reference entry strictly in the chosen citation style using sanitized verified metadata.
  */
-function formatVerifiedReference(doc: MedicalDocument, citationStyle: string, indexOneBased: number): string {
+function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string, indexOneBased: number): string {
+  const doc = sanitizeDocumentMetadata(rawDoc);
   const authorList = doc.authors && doc.authors.length > 0
     ? doc.authors.slice(0, 6).join(', ') + (doc.authors.length > 6 ? ', et al.' : '')
     : `${doc.firstAuthor} et al.`;
+  const cleanTitle = doc.title.replace(/\.+$/, '');
+  const cleanJournal = doc.journal.replace(/\.+$/, '');
   const pmidSegment = doc.pmid ? ` PMID: ${doc.pmid}.` : '';
   const pmcidSegment = doc.pmcid ? ` PMCID: ${doc.pmcid}.` : '';
-  const doiSegment = doc.doi ? `doi:${doc.doi}` : '';
+  const doiUrl = doc.doi ? `https://doi.org/${doc.doi}` : '';
+  const doiText = doc.doi ? `doi:${doc.doi}.` : '';
 
   if (citationStyle === 'APA') {
-    return `${authorList} (${doc.year}). ${doc.title}. *${doc.journal}*. ${doc.doi ? `https://doi.org/${doc.doi}` : ''}${pmidSegment}${pmcidSegment}`.trim();
+    const parts = [
+      `${authorList} (${doc.year}).`,
+      `${cleanTitle}.`,
+      `*${cleanJournal}*.`,
+      doiUrl,
+      pmidSegment.trim(),
+      pmcidSegment.trim()
+    ].filter(Boolean);
+    return parts.join(' ').trim();
   }
   if (citationStyle === 'Chicago') {
-    return `${indexOneBased}. ${authorList}. "${doc.title}." *${doc.journal}* (${doc.year}). ${doiSegment}.${pmidSegment}${pmcidSegment}`.trim();
+    const parts = [
+      `${indexOneBased}. ${authorList}.`,
+      `"${cleanTitle}."`,
+      `*${cleanJournal}* (${doc.year}).`,
+      doiText,
+      pmidSegment.trim(),
+      pmcidSegment.trim()
+    ].filter(Boolean);
+    return parts.join(' ').trim();
   }
   if (citationStyle === 'MLA') {
-    return `${authorList}. "${doc.title}." *${doc.journal}*, ${doc.year}, ${doc.doi ? `https://doi.org/${doc.doi}` : ''}.${pmidSegment}${pmcidSegment}`.trim();
+    const parts = [
+      `${authorList}.`,
+      `"${cleanTitle}."`,
+      `*${cleanJournal}*, ${doc.year}${doiUrl ? `, ${doiUrl}` : ''}.`,
+      pmidSegment.trim(),
+      pmcidSegment.trim()
+    ].filter(Boolean);
+    return parts.join(' ').trim();
   }
   // Vancouver (ICMJE)
-  return `${indexOneBased}. ${authorList}. ${doc.title}. ${doc.journal}. ${doc.year}; ${doiSegment}.${pmidSegment}${pmcidSegment}`.trim();
+  const parts = [
+    `${indexOneBased}. ${authorList}.`,
+    `${cleanTitle}.`,
+    `${cleanJournal}.`,
+    `${doc.year};`,
+    doiText,
+    pmidSegment.trim(),
+    pmcidSegment.trim()
+  ].filter(Boolean);
+  return parts.join(' ').trim();
+}
+
+/**
+ * Deterministically renders Section 6 (References) from cited studies in the requested style.
+ * Alphabetizes for APA/MLA; preserves order of first appearance for Vancouver/Chicago.
+ */
+function buildDeterministicReferencesContent(citedDocs: MedicalDocument[], citationStyle: string): string {
+  if (!citedDocs || citedDocs.length === 0) {
+    return 'No verified sources from the retrieved evidence pool were cited inline in the preceding manuscript sections.';
+  }
+
+  const normalizedDocs = citedDocs.map(sanitizeDocumentMetadata);
+  const orderedDocs = (citationStyle === 'APA' || citationStyle === 'MLA')
+    ? [...normalizedDocs].sort((a, b) => {
+        const nameA = (a.firstAuthor || '').toLowerCase();
+        const nameB = (b.firstAuthor || '').toLowerCase();
+        if (nameA !== nameB) return nameA.localeCompare(nameB);
+        return (a.year || 0) - (b.year || 0);
+      })
+    : normalizedDocs;
+
+  return orderedDocs
+    .map((d, i) => formatVerifiedReference(d, citationStyle, i + 1))
+    .join('\n\n');
 }
 
 /**
@@ -346,7 +262,7 @@ export function verifyAndEnforceClinicalGrounding(
   const hasRcts = stats.studyDesigns.includes('Randomized Controlled Trial');
   const rctCount = stats.studyDesignCounts['Randomized Controlled Trial'] || 0;
   const designSummary = Object.entries(stats.studyDesignCounts)
-    .map(([design, count]) => `${count} ${design}${count > 1 ? 's' : ''}`)
+    .map(([design, count]) => `${count} ${pluralizeStudyDesign(design, count)}`)
     .join(', ');
 
   // Match bracketed citations that are NOT markdown links `[label](url)` and contain a year / PMID / DOI / et al.
@@ -399,14 +315,14 @@ export function verifyAndEnforceClinicalGrounding(
       const noRctClaimRegex = /\b(?:no|absence\s+of|lack\s+of)\s+randomized\s+controlled\s+trials?\s+(?:were\s+)?(?:included|identified|retrieved|available)[^.]*\./gi;
 
       if (obsFalseClaimRegex.test(text)) {
-        const replacement = `The retrieved evidence includes ${rctCount} Randomized Controlled Trial${rctCount > 1 ? 's' : ''} alongside other study designs (${designSummary || 'mixed designs'}), rather than exclusively observational studies.`;
+        const replacement = `The retrieved evidence includes ${rctCount} ${pluralizeStudyDesign('Randomized Controlled Trial', rctCount)} alongside other study designs (${designSummary || 'mixed designs'}), rather than exclusively observational studies.`;
         text = text.replace(obsFalseClaimRegex, replacement);
         contradictionsFixed.push('Corrected false claim that all included studies were observational when RCTs were retrieved.');
         console.warn('[paperDraftService] Grounding guardrail fixed observational-only contradiction in Discussion/Limitations.');
       }
 
       if (noRctClaimRegex.test(text)) {
-        const replacement = `${rctCount} Randomized Controlled Trial${rctCount > 1 ? 's were' : ' was'} included in this synthesis (${designSummary}).`;
+        const replacement = `${rctCount} ${pluralizeStudyDesign('Randomized Controlled Trial', rctCount)} ${rctCount > 1 ? 'were' : 'was'} included in this synthesis (${designSummary}).`;
         text = text.replace(noRctClaimRegex, replacement);
         contradictionsFixed.push('Corrected false claim asserting no RCTs were included.');
         console.warn('[paperDraftService] Grounding guardrail fixed missing-RCT contradiction in Discussion/Limitations.');
@@ -415,44 +331,61 @@ export function verifyAndEnforceClinicalGrounding(
       if (/\bfuture\s+(?:randomized\s+controlled\s+trials|rcts?)\s+are\s+needed\b/i.test(text) && !/\bdespite|given|small|longer|multi-?center|additional|larger\b/i.test(text)) {
         text = text.replace(
           /\b(future\s+(?:randomized\s+controlled\s+trials|rcts?)\s+are\s+needed)\b/gi,
-          `$1 (building upon the ${rctCount} existing RCT${rctCount > 1 ? 's' : ''} in this synthesis to address sample size or follow-up constraints)`
+          `$1 (building upon the ${rctCount} existing ${pluralizeStudyDesign('Randomized Controlled Trial', rctCount)} in this synthesis to address sample size or follow-up constraints)`
         );
         contradictionsFixed.push('Contextualized recommendation for future RCTs against existing synthesized RCTs.');
       }
     }
 
-    const words = text.trim().split(/\s+/).filter(Boolean).length;
+    // Ensure sec-title contains at most one # heading cleanly
+    if (sec.type === 'title') {
+      const lines = text.split('\n');
+      let seenTopHeading = false;
+      text = lines.filter((line) => {
+        if (/^#\s+/.test(line.trim())) {
+          if (seenTopHeading) return false;
+          seenTopHeading = true;
+        }
+        return true;
+      }).join('\n');
+    }
+
+    const cleanOut = humanizeMedicalProse(text).trim();
+    const words = cleanOut.split(/\s+/).filter(Boolean).length;
     return {
       ...sec,
-      content: humanizeMedicalProse(text).trim(),
+      content: cleanOut,
       wordCount: words
     };
   });
 
-  // Ensure References section contains ONLY verified cited sources from CONTEXT_SOURCES
+  // Deterministically render References section from actual verified inline citations used in Sections 1-5
+  const formattedRefsContent = clinicalEvidence.length === 0
+    ? 'No verified references were cited from retrieved clinical databases.'
+    : buildDeterministicReferencesContent(citedDocsOrder, citationStyle);
+
+  let hasReferencesSection = false;
   const finalSections = verifiedSections.map((sec) => {
     if (sec.type !== 'references') return sec;
-
-    if (clinicalEvidence.length === 0) {
-      const noEvidenceMsg = 'No verified references were cited from retrieved clinical databases.';
-      return {
-        ...sec,
-        content: noEvidenceMsg,
-        wordCount: noEvidenceMsg.split(/\s+/).length
-      };
-    }
-
-    const docsToList = citedDocsOrder.length > 0 ? citedDocsOrder : [];
-    const formattedRefs = docsToList.length > 0
-      ? docsToList.map((d, i) => formatVerifiedReference(d, citationStyle, i + 1)).join('\n\n')
-      : 'No verified sources from the retrieved evidence pool were cited inline in the preceding manuscript sections.';
-
+    hasReferencesSection = true;
     return {
       ...sec,
-      content: formattedRefs,
-      wordCount: formattedRefs.trim().split(/\s+/).filter(Boolean).length
+      title: sec.title || `6. References (${citationStyle})`,
+      content: formattedRefsContent,
+      wordCount: formattedRefsContent.trim().split(/\s+/).filter(Boolean).length
     };
   });
+
+  if (!hasReferencesSection && sections.some(s => s.type === 'conclusion' || s.type === 'discussion' || s.type === 'results')) {
+    finalSections.push({
+      id: 'sec-references',
+      type: 'references',
+      title: `6. References (${citationStyle})`,
+      content: formattedRefsContent,
+      keyPoints: [`Deterministically formatted in ${citationStyle}`],
+      wordCount: formattedRefsContent.trim().split(/\s+/).filter(Boolean).length
+    });
+  }
 
   const report: GroundingVerificationReport = {
     verifiedCitationsCount: citedDocsOrder.length,
@@ -472,16 +405,19 @@ export function verifyAndEnforceClinicalGrounding(
 export async function generatePaperDraft(params: GenerateDraftRequest): Promise<PaperDraft> {
   const {
     researchQuestion,
-    targetJournal = 'The Lancet',
-    targetDatabases = ['PubMed/NCBI Entrez', 'PMC', 'OpenAlex', 'DOAJ', 'Crossref'],
-    citationStyle = 'Vancouver',
+    targetJournal = 'Standard Academic / ICMJE Systematic Review',
+    targetDatabases = [],
+    citationStyle = 'APA',
     mode = 'full_draft',
     clinicalEvidence = [],
     retrievalStats
   } = params;
 
-  const stats = buildRetrievalStats(clinicalEvidence, targetDatabases, retrievalStats);
-  const { picoMatrixJson, contextSourcesText, statsMetadataText } = buildGroundedEvidenceContext(clinicalEvidence, stats, 15);
+  // Dynamic query-relevance ranking & keyword-collision filtering BEFORE building Context & Section 3.3 / 4
+  const ranked = rankAndFilterStudiesForQuestion(clinicalEvidence, researchQuestion);
+  const relevantStudies = ranked.relevantStudies;
+  const stats = buildRetrievalStats(relevantStudies, targetDatabases, retrievalStats, ranked.totalEvaluated);
+  const { picoMatrixJson, contextSourcesText, statsMetadataText } = buildCorpusContext(relevantStudies, stats, 15);
 
   const systemPrompt = `You are an elite academic medical writer, biostatistician, and clinical journal editor specializing in ${targetJournal} style and ICMJE biomedical reporting guidelines.
 Your lead author is Dr. Puneet Maheshwari.
@@ -593,25 +529,36 @@ Return ONLY a valid JSON object with this exact schema:
   }
 
   if (!parsedResponse || !Array.isArray(parsedResponse.sections)) {
-    parsedResponse = createRuleBasedDraft(researchQuestion, targetJournal, stats, citationStyle, mode, clinicalEvidence);
+    parsedResponse = createRuleBasedDraft(researchQuestion, targetJournal, stats, citationStyle, mode, relevantStudies);
   }
+
+  const draftTitle = decodeHtmlEntities(parsedResponse.title || '') || buildAccurateDefaultTitle(researchQuestion, stats);
 
   const rawSections: PaperSection[] = parsedResponse.sections.map((s: any, idx: number) => {
     const cleanContent = humanizeMedicalProse(s.content || '');
     return {
       id: s.id || `sec-${idx}-${Date.now()}`,
       type: s.type || 'custom',
-      title: s.title || `Section ${idx + 1}`,
+      title: decodeHtmlEntities(s.title || `Section ${idx + 1}`),
       content: cleanContent,
       keyPoints: Array.isArray(s.keyPoints) ? s.keyPoints.map(humanizeMedicalProse) : [],
       wordCount: cleanContent.trim().split(/\s+/).filter(Boolean).length
     };
   });
 
+  // Ensure sec-title has a clean single # title if omitted or duplicated
+  for (const sec of rawSections) {
+    if (sec.type === 'title') {
+      const stripped = sec.content.replace(/^(?:#+\s*[^\n]*\n+)+/, '').trim();
+      sec.content = `# ${draftTitle}${stripped ? `\n\n${stripped}` : ''}`;
+      sec.wordCount = sec.content.split(/\s+/).filter(Boolean).length;
+    }
+  }
+
   // Post-generation automated verification guardrail
   const { sections: verifiedSections, report } = verifyAndEnforceClinicalGrounding(
     rawSections,
-    clinicalEvidence,
+    relevantStudies,
     stats,
     citationStyle
   );
@@ -620,14 +567,14 @@ Return ONLY a valid JSON object with this exact schema:
 
   return {
     id: `draft-${Date.now()}`,
-    title: parsedResponse.title || buildAccurateDefaultTitle(researchQuestion, stats),
+    title: draftTitle,
     researchQuestion,
     targetJournal,
     targetDatabases: stats.databasesQueried,
     citationStyle,
     mode,
-    author: parsedResponse.author || 'Dr. Puneet Maheshwari',
-    affiliation: parsedResponse.affiliation || 'Department of Evidence-Based Medicine & Clinical Research',
+    author: decodeHtmlEntities(parsedResponse.author || 'Dr. Puneet Maheshwari'),
+    affiliation: decodeHtmlEntities(parsedResponse.affiliation || 'Department of Evidence-Based Medicine & Clinical Research'),
     date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
     sections: verifiedSections,
     totalWords,
@@ -641,13 +588,13 @@ Return ONLY a valid JSON object with this exact schema:
 function getSectionGroundingGuidance(sectionTitle: string, sectionType?: PaperSection['type']): string {
   const hint = `${sectionType || ''} ${sectionTitle}`.toLowerCase();
   if (hint.includes('title') || hint.includes('abstract')) {
-    return 'Reflect the exact study designs retrieved. Do not claim "superiority" unless pooled meta-analytic metrics in CONTEXT_SOURCES prove statistical superiority; use "comparative effectiveness" or "non-inferiority."';
+    return 'Reflect the exact study designs retrieved using proper pluralization (Cohort Studies, Meta-Analyses, Case Series). Do not claim "superiority" unless pooled meta-analytic metrics in CONTEXT_SOURCES prove statistical superiority; use "comparative effectiveness" or "non-inferiority."';
   }
   if (hint.includes('intro')) {
     return 'Frame the clinical gap strictly around the PICO question. Do not invent epidemiological prevalence figures unless cited from CONTEXT_SOURCES.';
   }
   if (hint.includes('method')) {
-    return 'Report ONLY the exact databases queried (PubMed/NCBI Entrez, PMC, OpenAlex, DOAJ, Crossref) and exact retrieval counts (Total Indexed Records vs. Unique Studies Included) from RETRIEVAL_METADATA. Never invent PRISMA screening counts or RoB 2 scores.';
+    return 'Report ONLY the exact databases actually queried (databasesQueried) and primary deduplicated counts (primarySourceCountsSummingToUnique) from RETRIEVAL_METADATA, with PMC reported strictly as an open-access full-text enrichment subset of PubMed. Never invent PRISMA screening counts or RoB 2 scores.';
   }
   if (hint.includes('result')) {
     return 'Report exact study design breakdown, ONLY mechanisms explicitly written in PMC_METHODS/PMC_RESULTS/PMC_DISCUSSION/AbstractText, and verbatim N, HR, RR, OR, 95% CI, and p-values from PICO_MATRIX/PMC_TABLES with inline [Author, Year (PMID/DOI)] citations. Write "Not reported in the retrieved studies" for missing items.';
@@ -677,19 +624,29 @@ export async function transformSection(
     sectionType,
     sectionContent,
     researchQuestion = '',
-    targetJournal = 'The Lancet',
-    citationStyle = 'Vancouver',
+    targetJournal = 'Standard Academic / ICMJE Systematic Review',
+    citationStyle = 'APA',
     customPrompt,
     clinicalEvidence = [],
     retrievalStats
   } = params;
 
+  const ranked = researchQuestion
+    ? rankAndFilterStudiesForQuestion(clinicalEvidence, researchQuestion)
+    : {
+        relevantStudies: clinicalEvidence.map(sanitizeDocumentMetadata),
+        filteredOutCount: 0,
+        totalEvaluated: clinicalEvidence.length,
+        queryEntities: []
+      };
+  const relevantStudies = ranked.relevantStudies;
   const stats = buildRetrievalStats(
-    clinicalEvidence,
-    retrievalStats?.databasesQueried || ['PubMed/NCBI Entrez', 'PMC', 'OpenAlex', 'DOAJ', 'Crossref'],
-    retrievalStats
+    relevantStudies,
+    retrievalStats?.databasesQueried || [],
+    retrievalStats,
+    ranked.totalEvaluated
   );
-  const { picoMatrixJson, contextSourcesText, statsMetadataText } = buildGroundedEvidenceContext(clinicalEvidence, stats, 12);
+  const { picoMatrixJson, contextSourcesText, statsMetadataText } = buildCorpusContext(relevantStudies, stats, 12);
   const sectionGuidance = getSectionGroundingGuidance(sectionTitle, sectionType);
 
   let actionInstruction = '';
@@ -750,7 +707,7 @@ Return ONLY the revised section content text (no preamble or code fences). Do no
   }
 
   if (!candidateText) {
-    candidateText = buildGroundedFallbackSectionAction(action, sectionContent, clinicalEvidence, citationStyle);
+    candidateText = buildGroundedFallbackSectionAction(action, sectionContent, relevantStudies, citationStyle);
   }
 
   // Run post-generation verification guardrail on the revised section
@@ -765,17 +722,27 @@ Return ONLY the revised section content text (no preamble or code fences). Do no
       : /conclu/i.test(sectionTitle) ? 'conclusion'
       : 'custom');
 
-  if (inferredType === 'references' && clinicalEvidence.length > 0) {
-    // Only filter/keep references that actually exist in clinicalEvidence
+  if (inferredType === 'references' && relevantStudies.length > 0) {
+    // Only filter/keep references that actually exist in relevantStudies, or render deterministically
     const lines = candidateText.split(/\n+/).filter(l => l.trim().length > 0);
-    const verifiedLines = lines.filter(line => Boolean(findMatchingEvidenceDoc(line, clinicalEvidence)));
-    const finalRefContent = verifiedLines.length > 0
-      ? verifiedLines.join('\n\n')
-      : clinicalEvidence.slice(0, 8).map((d, i) => formatVerifiedReference(d, citationStyle, i + 1)).join('\n\n');
+    const matchedDocs: MedicalDocument[] = [];
+    const seen = new Set<string>();
+    for (const line of lines) {
+      const m = findMatchingEvidenceDoc(line, relevantStudies);
+      if (m) {
+        const key = (m.pmid || m.doi || m.id).toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          matchedDocs.push(m);
+        }
+      }
+    }
+    const docsToFormat = matchedDocs.length > 0 ? matchedDocs : relevantStudies.slice(0, 8);
+    const finalRefContent = buildDeterministicReferencesContent(docsToFormat, citationStyle);
     return {
       content: humanizeMedicalProse(finalRefContent),
       groundingVerification: {
-        verifiedCitationsCount: verifiedLines.length || Math.min(8, clinicalEvidence.length),
+        verifiedCitationsCount: docsToFormat.length,
         autoCorrectedCitations: [],
         unverifiedCitationsRemoved: [],
         contradictionsFixed: [],
@@ -793,7 +760,7 @@ Return ONLY the revised section content text (no preamble or code fences). Do no
         content: humanizeMedicalProse(candidateText)
       }
     ],
-    clinicalEvidence,
+    relevantStudies,
     stats,
     citationStyle
   );
@@ -843,11 +810,16 @@ function buildGroundedFallbackSectionAction(
 }
 
 function buildAccurateDefaultTitle(question: string, stats: RetrievalStatsMetadata): string {
-  const designsLabel = stats.studyDesigns.length > 0
-    ? stats.studyDesigns.slice(0, 3).join(' and ')
+  const designEntries = Object.entries(stats.studyDesignCounts);
+  const designsLabel = designEntries.length > 0
+    ? designEntries
+        .slice(0, 3)
+        .map(([design, count]) => pluralizeStudyDesign(design, Math.max(2, count)))
+        .join(', ')
     : 'Clinical Literature';
-  const cleanQ = question.trim().charAt(0).toUpperCase() + question.trim().slice(1);
-  return `Systematic Evidence Synthesis of ${designsLabel}: ${cleanQ}`;
+  const cleanQ = decodeHtmlEntities(question).trim();
+  const formattedQ = cleanQ.charAt(0).toUpperCase() + cleanQ.slice(1);
+  return `Systematic Evidence Synthesis of ${designsLabel}: ${formattedQ}`;
 }
 
 /**
@@ -862,39 +834,46 @@ function createRuleBasedDraft(
   _mode: string,
   evidence: MedicalDocument[]
 ): { title: string; author: string; affiliation: string; sections: PaperSection[] } {
+  const sanitizedEvidence = evidence.map(sanitizeDocumentMetadata);
   const title = buildAccurateDefaultTitle(question, stats);
   const author = 'Dr. Puneet Maheshwari';
   const affiliation = 'Department of Evidence-Based Medicine & Clinical Research';
 
   const designBreakdownText = Object.entries(stats.studyDesignCounts)
-    .map(([d, c]) => `${c} ${d}${c > 1 ? 's' : ''}`)
+    .map(([d, c]) => `${c} ${pluralizeStudyDesign(d, c)}`)
     .join(', ') || '0 studies';
 
   const dbBreakdownText = Object.entries(stats.databaseBreakdown)
     .map(([db, c]) => `${db} (n = ${c})`)
     .join(', ') || stats.databasesQueried.join(', ');
 
-  const smallSampleDocs = evidence.filter(d => (d.pico?.sampleSize || 0) > 0 && d.pico.sampleSize < 100);
-  const missingSampleDocs = evidence.filter(d => !d.pico?.sampleSize || d.pico.sampleSize === 0);
+  const pmcSubsetNote = stats.pubmedTotalCount > 0 || stats.pmcFullTextCount > 0
+    ? `; PMC open-access full text retrieved for ${stats.pmcFullTextCount} of ${stats.pubmedTotalCount} PubMed records`
+    : '';
+
+  const smallSampleDocs = sanitizedEvidence.filter(d => (d.pico?.sampleSize || 0) > 0 && d.pico.sampleSize < 100);
+  const missingSampleDocs = sanitizedEvidence.filter(d => !d.pico?.sampleSize || d.pico.sampleSize === 0);
   const rctCount = stats.studyDesignCounts['Randomized Controlled Trial'] || 0;
 
-  const studyEvidenceParagraphs = evidence.slice(0, 6).map((d) => {
+  const studyEvidenceParagraphs = sanitizedEvidence.slice(0, 6).map((d) => {
     const cit = formatCanonicalCitation(d);
-    const nVal = d.pico?.sampleSize > 0 ? `N = ${d.pico.sampleSize}` : 'N = Not reported in the retrieved studies';
-    const hrVal = d.pico?.hazardRatio ? `HR ${d.pico.hazardRatio}` : 'HR: Not reported in the retrieved studies';
-    const rrVal = d.pico?.riskRatio ? `RR ${d.pico.riskRatio}` : 'RR: Not reported in the retrieved studies';
-    const pVal = d.pico?.pValues?.length ? d.pico.pValues.join(', ') : 'Not reported in the retrieved studies';
-    return `- **${d.firstAuthor} et al. (${d.year}, ${d.pico?.design || 'Study'})** evaluated ${d.pico?.population || 'study participants'} (${nVal}), comparing ${d.pico?.intervention || 'active intervention'} against ${d.pico?.comparator || 'comparator'}, with outcome ${d.pico?.primaryOutcome || 'clinical outcome'} (${hrVal}; ${rrVal}; ${pVal}) ${cit}.`;
+    const nVal = d.pico?.sampleSize > 0 ? `N = ${d.pico.sampleSize}` : 'N = Not reported';
+    const hrVal = d.pico?.hazardRatio ? `HR ${d.pico.hazardRatio}` : 'HR: Not reported';
+    const rrVal = d.pico?.riskRatio ? `RR ${d.pico.riskRatio}` : 'RR: Not reported';
+    const pVal = d.pico?.pValues?.length ? d.pico.pValues.join(', ') : 'p-value: Not reported';
+    const popText = d.pico?.population && d.pico.population !== 'Not reported' ? d.pico.population : 'study participants (eligibility criteria not reported)';
+    const intText = d.pico?.intervention && d.pico.intervention !== 'Not reported' ? d.pico.intervention : 'evaluated intervention (regimen details not reported)';
+    const compText = d.pico?.comparator && d.pico.comparator !== 'Not reported' ? d.pico.comparator : 'comparator arm (not reported)';
+    const outText = d.pico?.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'clinical outcomes (not reported)';
+    return `- **${d.firstAuthor} et al. (${d.year}, ${d.pico?.design || 'Study'})** evaluated ${popText} (${nVal}), comparing ${intText} against ${compText}, with primary outcome ${outText} (${hrVal}; ${rrVal}; ${pVal}) ${cit}.`;
   }).join('\n');
 
-  const citedDocs = evidence.slice(0, 6);
-  const referencesContent = citedDocs.length > 0
-    ? citedDocs.map((d, i) => formatVerifiedReference(d, citationStyle, i + 1)).join('\n\n')
-    : 'No verified sources were retrieved for citation.';
+  const citedDocs = sanitizedEvidence.slice(0, 6);
+  const referencesContent = buildDeterministicReferencesContent(citedDocs, citationStyle);
 
   const limitationsNotes: string[] = [];
   if (rctCount > 0) {
-    limitationsNotes.push(`the synthesized pool contains ${rctCount} Randomized Controlled Trial${rctCount > 1 ? 's' : ''} alongside ${Math.max(0, stats.uniqueIncluded - rctCount)} non-randomized or review studies (${designBreakdownText})`);
+    limitationsNotes.push(`the synthesized pool contains ${rctCount} ${pluralizeStudyDesign('Randomized Controlled Trial', rctCount)} alongside ${Math.max(0, stats.uniqueIncluded - rctCount)} non-randomized or review studies (${designBreakdownText})`);
   } else if (stats.uniqueIncluded > 0) {
     limitationsNotes.push(`the retrieved pool comprises ${designBreakdownText}`);
   }
@@ -921,7 +900,7 @@ function createRuleBasedDraft(
         id: 'sec-abstract',
         type: 'abstract',
         title: 'Structured Abstract',
-        content: `**Background:** This evaluation examines comparative effectiveness regarding **${question}** strictly within retrieved clinical records.\n\n**Methods:** Databases queried comprised ${stats.databasesQueried.join(', ')}, yielding ${stats.totalIndexed} total indexed records and ${stats.uniqueIncluded} unique included studies (${stats.pmcFullTextCount} with PMC open-access full text).\n\n**Results:** Included study designs comprised ${designBreakdownText}. ${evidence[0] ? `Primary findings from ${evidence[0].firstAuthor} et al. (${evidence[0].year}) reported ${evidence[0].pico?.primaryOutcome || 'primary outcomes'} ${formatCanonicalCitation(evidence[0])}.` : 'No retrieved studies were available for quantitative summary.'}\n\n**Conclusion:** Findings apply strictly to the clinical cohorts and outcomes reported in the ${stats.uniqueIncluded} retrieved studies.`,
+        content: `**Background:** This evaluation examines comparative effectiveness regarding **${question}** strictly within retrieved clinical records.\n\n**Methods:** Databases queried comprised ${stats.databasesQueried.join(', ')}, yielding ${stats.totalIndexed} total evaluated records and ${stats.uniqueIncluded} unique relevant studies included (${dbBreakdownText}${pmcSubsetNote}).\n\n**Results:** Included study designs comprised ${designBreakdownText}. ${sanitizedEvidence[0] ? `Primary findings from ${sanitizedEvidence[0].firstAuthor} et al. (${sanitizedEvidence[0].year}) reported ${sanitizedEvidence[0].pico?.primaryOutcome && sanitizedEvidence[0].pico.primaryOutcome !== 'Not reported' ? sanitizedEvidence[0].pico.primaryOutcome : 'clinical outcomes'} ${formatCanonicalCitation(sanitizedEvidence[0])}.` : 'No retrieved studies were available for quantitative summary.'}\n\n**Conclusion:** Findings apply strictly to the clinical cohorts and outcomes reported in the ${stats.uniqueIncluded} included studies.`,
         keyPoints: [`${stats.uniqueIncluded} unique studies included`, `Designs: ${designBreakdownText}`]
       },
       {
@@ -935,21 +914,21 @@ function createRuleBasedDraft(
         id: 'sec-methods',
         type: 'methods',
         title: '2. Methods (Search & Synthesis Protocol)',
-        content: `### Databases Queried & Retrieval Counts\nWe queried **${stats.databasesQueried.join(', ')}**. Across all queries, **Total Indexed Records** was ${stats.totalIndexed} and **Unique Studies Included** was ${stats.uniqueIncluded} (${dbBreakdownText}). Formal PRISMA screening counts and Cochrane RoB 2 scores were not computed by the backend and are not reported in the retrieved studies.`,
-        keyPoints: [`Databases: ${stats.databasesQueried.join(', ')}`, `Total Indexed: ${stats.totalIndexed}; Unique Included: ${stats.uniqueIncluded}`]
+        content: `### Databases Queried & Retrieval Counts\nWe queried **${stats.databasesQueried.join(', ')}**. Across all queries, **Total Evaluated Records** was ${stats.totalIndexed} (${stats.filteredOutLowRelevanceCount} low-relevance keyword-collision hits excluded prior to synthesis) and **Unique Studies Included** was ${stats.uniqueIncluded}, decomposed across primary sources as: ${dbBreakdownText}. Within PubMed records, **PMC open-access full text** was retrieved as an enrichment subset for ${stats.pmcFullTextCount} of ${stats.pubmedTotalCount} PubMed studies. Formal PRISMA screening counts and Cochrane RoB 2 scores were not computed by the backend and are not reported in the retrieved studies.`,
+        keyPoints: [`Databases: ${stats.databasesQueried.join(', ')}`, `Total Evaluated: ${stats.totalIndexed}; Unique Included: ${stats.uniqueIncluded}; PMC Subset: ${stats.pmcFullTextCount}`]
       },
       {
         id: 'sec-results',
         type: 'results',
         title: '3. Results & Clinical Evidence Evaluation',
-        content: `### 3.1 Study Selection\nA total of ${stats.uniqueIncluded} unique studies were evaluated, comprising: ${designBreakdownText}.\n\n### 3.2 Biological & Pharmacological Mechanisms\nSpecific pharmacokinetic or mechanistic pathways beyond those explicitly written in the retrieved abstracts or PMC full-text sections were not reported in the retrieved studies.\n\n### 3.3 Quantitative Statistical Metrics\n${studyEvidenceParagraphs || 'Not reported in the retrieved studies.'}`,
+        content: `### 3.1 Study Selection\nA total of ${stats.uniqueIncluded} unique relevant studies were evaluated, comprising: ${designBreakdownText}.\n\n### 3.2 Biological & Pharmacological Mechanisms\nSpecific pharmacokinetic or mechanistic pathways beyond those explicitly written in the retrieved abstracts or PMC full-text sections were not reported in the retrieved studies.\n\n### 3.3 Quantitative Statistical Metrics\n${studyEvidenceParagraphs || 'Not reported in the retrieved studies.'}`,
         keyPoints: [`Study breakdown: ${designBreakdownText}`, 'Verbatim PICO_MATRIX statistics with verified inline citations']
       },
       {
         id: 'sec-discussion',
         type: 'discussion',
         title: '4. Discussion & Limitations',
-        content: `### Discussion\nAcross the ${stats.uniqueIncluded} evaluated studies, comparative effectiveness outcomes varied according to study design and sample size. ${citedDocs.slice(0, 2).map(d => `${d.firstAuthor} et al. (${d.year}) reported ${d.pico?.primaryOutcome || 'clinical outcomes'} ${formatCanonicalCitation(d)}`).join('; ') || 'No study comparisons available.'}.\n\n### Limitations\nLimitations derived strictly from retrieved PICO_MATRIX metadata include: ${limitationsNotes.join('; ') || 'limited metadata across retrieved records'}.`,
+        content: `### Discussion\nAcross the ${stats.uniqueIncluded} evaluated studies, comparative effectiveness outcomes varied according to study design and sample size. ${citedDocs.slice(0, 2).map(d => `${d.firstAuthor} et al. (${d.year}) evaluated ${d.pico?.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : d.title} ${formatCanonicalCitation(d)}`).join('; ') || 'No study comparisons available.'}.\n\n### Limitations\nLimitations derived strictly from retrieved PICO_MATRIX metadata include: ${limitationsNotes.join('; ') || 'limited metadata across retrieved records'}.`,
         keyPoints: [`Grounded in ${designBreakdownText}`, 'Limitations derived strictly from retrieved PICO_MATRIX']
       },
       {
@@ -964,7 +943,7 @@ function createRuleBasedDraft(
         type: 'references',
         title: `6. References (${citationStyle})`,
         content: referencesContent,
-        keyPoints: [`Formatted in ${citationStyle}`]
+        keyPoints: [`Deterministically formatted in ${citationStyle}`]
       }
     ]
   };
