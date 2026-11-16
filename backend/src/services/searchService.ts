@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { GoogleGenAI } from '@google/genai';
 import { extractMetaMapLiteConcepts } from './metaMapLiteService.js';
+import { enrichArticlesWithFullText, FullTextSections } from './pmcFullTextService.js';
 
 export interface Author {
   name: string;
@@ -38,6 +39,10 @@ export interface MedicalDocument {
   year: number;
   doi: string;
   pmid?: string;
+  pmcid?: string;
+  hasFullText?: boolean;
+  fullText?: string;
+  fullTextSections?: FullTextSections;
   abstract: string;
   citationCount: number;
   isOpenAccess: boolean;
@@ -200,6 +205,22 @@ export function extractSampleSize(text: string, title = '', design?: PicoData['d
     if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
   }
 
+  // Pattern G: Table/Methods rows such as "Total patients | 120", "Sample size: 84", "Patients (n = 96)"
+  const tableTotalMatches = combined.matchAll(/\b(?:total\s+(?:cohort|sample|patients|participants|subjects|cases|fractures|population)|sample\s*size)\s*(?:\([^)]*\))?\s*[:=|]\s*(\d{1,3}(?:,\d{3})*|\d+)\b/gi);
+  for (const tm of tableTotalMatches) {
+    if (tm[1]) {
+      const parsed = parseInt(tm[1].replace(/,/g, ''), 10);
+      if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+    }
+  }
+  const parenNMatches = combined.matchAll(/\b(?:patients|participants|subjects|individuals|cases|fractures|cohort)\s*\(\s*[Nn]\s*(?:\|\s*)?[=:]?\s*(\d{1,3}(?:,\d{3})*|\d+)\s*\)/gi);
+  for (const pm of parenNMatches) {
+    if (pm[1]) {
+      const parsed = parseInt(pm[1].replace(/,/g, ''), 10);
+      if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+    }
+  }
+
   // If identified as a single case report and no larger cohort was found: exactly 1 patient
   if (isCaseReport) {
     const smallCandidate = candidates.find(c => c > 0 && c <= 10);
@@ -216,18 +237,25 @@ export function extractSampleSize(text: string, title = '', design?: PicoData['d
 }
 
 /**
- * Extracts p-values from abstract text
+ * Extracts p-values from clinical text (full-text sections or abstract)
  */
-export function extractPValues(text: string): string[] {
-  const pRegex = /\b(?:p|P)\s*([<>=]|&lt;|&gt;)\s*(0?\.\d{2,5}|0001|001|01|05)/g;
+export function extractPValues(text: string, maxValues = 4, fallbackIfEmpty = true): string[] {
+  if (!text) return fallbackIfEmpty ? ['p < 0.001'] : [];
+  const pRegex = /\b(?:p|P)\s*([<>]=?|=|&lt;=|&gt;=|&lt;|&gt;)\s*(0?\.\d{1,5}|0001|001|01|05)\b/g;
   const pVals: string[] = [];
+  const seen = new Set<string>();
   let m: RegExpExecArray | null;
   while ((m = pRegex.exec(text)) !== null) {
     const symbol = m[1].replace('&lt;', '<').replace('&gt;', '>');
-    pVals.push(`p ${symbol} ${m[2]}`);
-    if (pVals.length >= 4) break;
+    const formatted = `p ${symbol} ${m[2]}`;
+    if (!seen.has(formatted)) {
+      seen.add(formatted);
+      pVals.push(formatted);
+    }
+    if (pVals.length >= maxValues) break;
   }
-  return pVals.length > 0 ? Array.from(new Set(pVals)) : ['p < 0.001'];
+  if (pVals.length > 0) return pVals;
+  return fallbackIfEmpty ? ['p < 0.001'] : [];
 }
 
 /**
@@ -295,43 +323,127 @@ export function inferStudyDesign(title: string, abstract: string): PicoData['des
   return 'Clinical Trial';
 }
 
+function extractHazardRatioFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const hrMatch = text.match(/\b(?:HR|aHR|hazard ratio)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
+  return hrMatch ? hrMatch[1].trim() : undefined;
+}
+
+function extractRiskRatioFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const rrMatch = text.match(/\b(?:RR|aRR|risk ratio|relative risk)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
+  if (rrMatch) return rrMatch[1].trim();
+  const orMatch = text.match(/\b(?:OR|aOR|odds ratio)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
+  return orMatch ? `OR ${orMatch[1].trim()}` : undefined;
+}
+
+function extractPopulationFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const popMatch = text.match(/(?:enrolled|included|recruited|in|among)\s+([A-Za-z0-9\s,–-]+?)(?:\.|\bwho\b|\bto receive\b|\bwith\b|\bwere randomized\b|\bwere divided\b)/i);
+  if (popMatch && popMatch[1].length < 130 && popMatch[1].length > 15) {
+    return popMatch[1].trim();
+  }
+  return undefined;
+}
+
+function extractInterventionFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const intMatch = text.match(/(?:assigned to receive|randomized to|allocated to|treated with|underwent|received)\s+([A-Za-z0-9\s,–-]+?)(?:\sor\b|\sversus\b|\svs\.?\b|\sagainst\b|\sas compared with\b|\sfor\b|\.|\,)/i);
+  if (intMatch && intMatch[1].length < 110 && intMatch[1].length > 6) {
+    return intMatch[1].trim();
+  }
+  return undefined;
+}
+
+function extractComparatorFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const compMatch = text.match(/(?:compared with|compared to|versus|vs\.?|control group received)\s+([A-Za-z0-9\s,–-]+?)(?:\.|\,|\sover\b|\sin\b|\sand\b)/i);
+  if (compMatch && compMatch[1].length < 90 && compMatch[1].length > 4) {
+    return compMatch[1].trim();
+  }
+  return undefined;
+}
+
+function extractPrimaryOutcomeFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const outcomeMatch = text.match(/(?:primary endpoint|primary outcome|primary composite endpoint|main outcome measure)\s*(?:was|were|included)?\s*([A-Za-z0-9\s,–-]+?)(?:\.|\;|occurred in)/i);
+  if (outcomeMatch && outcomeMatch[1].length < 150 && outcomeMatch[1].length > 12) {
+    return outcomeMatch[1].trim();
+  }
+  return undefined;
+}
+
 /**
- * Extracts PICO matrix elements from abstract
+ * Extracts PICO matrix elements from PMC full-text sections (`methods`, `results`, `tables`)
+ * when `hasFullText` is true, falling back cleanly to `<AbstractText>` when unavailable.
  */
-export function extractPicoData(title: string, abstract: string): PicoData {
-  const design = inferStudyDesign(title, abstract);
-  const sampleSize = extractSampleSize(title + ' ' + abstract, title, design);
-  const pValues = extractPValues(abstract);
+export function extractPicoData(
+  title: string,
+  abstract: string,
+  fullTextSections?: FullTextSections,
+  hasFullText = false
+): PicoData {
+  const useFullText = Boolean(
+    hasFullText &&
+    fullTextSections &&
+    (fullTextSections.methods || fullTextSections.results || fullTextSections.tables)
+  );
 
-  let hazardRatio: string | undefined;
-  const hrMatch = abstract.match(/\b(?:HR|hazard ratio)\s*[:=]?\s*([0-9]\.[0-9]{2}(?:\s*\(95%?\s*CI[,:\s]*[0-9]\.[0-9]{2}[-–to\s]+[0-9]\.[0-9]{2}\))?)/i);
-  if (hrMatch) {
-    hazardRatio = hrMatch[1];
+  const methodsAndResultsText = useFullText
+    ? [fullTextSections!.methods, fullTextSections!.results, fullTextSections!.tables].filter(Boolean).join('\n\n')
+    : '';
+  const resultsAndTablesText = useFullText
+    ? [fullTextSections!.results, fullTextSections!.tables, fullTextSections!.methods].filter(Boolean).join('\n\n')
+    : '';
+
+  const design = inferStudyDesign(
+    title,
+    useFullText ? `${abstract} ${fullTextSections?.methods || ''}` : abstract
+  );
+
+  let sampleSize = 0;
+  if (useFullText && methodsAndResultsText) {
+    sampleSize = extractSampleSize(methodsAndResultsText, title, design);
+  }
+  if (sampleSize === 0) {
+    sampleSize = extractSampleSize(`${title} ${abstract}`, title, design);
   }
 
-  let population = 'Adult patients matching clinical eligibility criteria';
-  const popMatch = abstract.match(/(?:enrolled|included|in|among)\s+([A-Za-z0-9\s,–-]+?)(?:\.|\bwho\b|\bto receive\b|\bwith\b|\bwere randomized\b)/i);
-  if (popMatch && popMatch[1].length < 120 && popMatch[1].length > 15) {
-    population = popMatch[1].trim();
+  let pValues: string[] = [];
+  if (useFullText && resultsAndTablesText) {
+    pValues = extractPValues(resultsAndTablesText, 6, false);
+  }
+  if (pValues.length === 0) {
+    pValues = extractPValues(abstract, 4, true);
   }
 
-  let intervention = 'Active therapeutic regimen or experimental agent';
-  const intMatch = abstract.match(/(?:assigned to receive|randomized to|treated with|received)\s+([A-Za-z0-9\s,–-]+?)(?:\sor\b|\sversus\b|\sagainst\b|\sas compared with\b|\sfor\b|\.|\,)/i);
-  if (intMatch && intMatch[1].length < 100 && intMatch[1].length > 8) {
-    intervention = intMatch[1].trim();
-  }
+  const hazardRatio =
+    (useFullText ? extractHazardRatioFromText(resultsAndTablesText) : undefined) ||
+    extractHazardRatioFromText(abstract);
 
-  let comparator = 'Placebo or standard-of-care control';
-  const compMatch = abstract.match(/(?:compared with|versus|vs\.?)\s+([A-Za-z0-9\s,–-]+?)(?:\.|\,|\sover\b|\sin\b)/i);
-  if (compMatch && compMatch[1].length < 80 && compMatch[1].length > 5) {
-    comparator = compMatch[1].trim();
-  }
+  const riskRatio =
+    (useFullText ? extractRiskRatioFromText(resultsAndTablesText) : undefined) ||
+    extractRiskRatioFromText(abstract);
 
-  let primaryOutcome = 'Primary composite clinical endpoint and safety profile';
-  const outcomeMatch = abstract.match(/(?:primary endpoint|primary outcome|primary composite endpoint)\s*(?:was|included)?\s*([A-Za-z0-9\s,–-]+?)(?:\.|\;|occurred in)/i);
-  if (outcomeMatch && outcomeMatch[1].length < 140 && outcomeMatch[1].length > 15) {
-    primaryOutcome = outcomeMatch[1].trim();
-  }
+  const population =
+    (useFullText ? extractPopulationFromText(methodsAndResultsText) : undefined) ||
+    extractPopulationFromText(abstract) ||
+    'Adult patients matching clinical eligibility criteria';
+
+  const intervention =
+    (useFullText ? extractInterventionFromText(methodsAndResultsText) : undefined) ||
+    extractInterventionFromText(abstract) ||
+    'Active therapeutic regimen or experimental agent';
+
+  const comparator =
+    (useFullText ? extractComparatorFromText(methodsAndResultsText) : undefined) ||
+    extractComparatorFromText(abstract) ||
+    'Placebo or standard-of-care control';
+
+  const primaryOutcome =
+    (useFullText ? extractPrimaryOutcomeFromText(methodsAndResultsText) : undefined) ||
+    extractPrimaryOutcomeFromText(abstract) ||
+    'Primary composite clinical endpoint and safety profile';
 
   return {
     population,
@@ -341,6 +453,7 @@ export function extractPicoData(title: string, abstract: string): PicoData {
     primaryOutcome,
     pValues,
     hazardRatio,
+    riskRatio,
     design
   };
 }
@@ -464,6 +577,9 @@ async function searchPubMed(query: string, limit = 40, offset = 0): Promise<Medi
       const doiMatch = block.match(/<ArticleId IdType="doi">([^<]+)<\/ArticleId>/i);
       const doi = doiMatch ? doiMatch[1].trim() : `10.1056/pubmed.${pmid}`;
 
+      const pmcMatch = block.match(/<ArticleId IdType="pmc">(?:PMC)?(\d+)<\/ArticleId>/i);
+      const pmcid = pmcMatch ? `PMC${pmcMatch[1].trim()}` : undefined;
+
       // Extract authors
       const authors: string[] = [];
       const authorMatches = block.matchAll(/<Author[^>]*>.*?<LastName>(.*?)<\/LastName>.*?<ForeName>(.*?)<\/ForeName>.*?<\/Author>/gis);
@@ -499,9 +615,11 @@ async function searchPubMed(query: string, limit = 40, offset = 0): Promise<Medi
         year,
         doi,
         pmid,
+        pmcid,
+        hasFullText: false,
         abstract: abstractText,
         citationCount: Math.floor(Math.random() * 150) + 20,
-        isOpenAccess: block.includes('<ArticleId IdType="pmc">') || block.includes('Free PMC article'),
+        isOpenAccess: Boolean(pmcid) || block.includes('<ArticleId IdType="pmc">') || block.includes('Free PMC article'),
         source: 'PubMed',
         webUrl: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
         pico: extractPicoData(title, abstractText)
@@ -512,10 +630,61 @@ async function searchPubMed(query: string, limit = 40, offset = 0): Promise<Medi
       return fetchPubMedSummaries(pmids, keyParam);
     }
 
+    // 3. Enrich top retrieved PubMed articles with open-access PMC full-text XML
+    await applyPmcFullTextEnrichment(docs, 25);
+
     return docs;
   } catch (err) {
     console.warn('[searchService] PubMed search warning:', err instanceof Error ? err.message : err);
     return [];
+  }
+}
+
+/**
+ * Prioritizes top clinical PubMed documents (including OA/PMCID-tagged articles)
+ * and enriches them with PubMed Central open-access full text, re-extracting PICO metrics.
+ */
+async function applyPmcFullTextEnrichment(docs: MedicalDocument[], maxToEnrich = 25): Promise<void> {
+  if (!docs || docs.length === 0) return;
+  try {
+    const docsWithPmid = docs.filter(d => d.pmid && /^\d+$/.test(d.pmid));
+    if (docsWithPmid.length === 0) return;
+
+    // Prioritize articles already flagged as PMC/OA plus top ranked clinical results
+    const prioritized = [...docsWithPmid].sort((a, b) => {
+      const aFlag = a.pmcid || a.isOpenAccess ? 1 : 0;
+      const bFlag = b.pmcid || b.isOpenAccess ? 1 : 0;
+      return bFlag - aFlag;
+    });
+
+    const targetPmids = Array.from(
+      new Set(prioritized.slice(0, maxToEnrich).map(d => d.pmid as string))
+    );
+
+    const enrichmentMap = await enrichArticlesWithFullText(targetPmids, 14000);
+
+    for (const doc of docs) {
+      if (!doc.pmid) continue;
+      const enriched = enrichmentMap[doc.pmid];
+      if (!enriched) continue;
+
+      if (enriched.pmcid && !doc.pmcid) {
+        doc.pmcid = enriched.pmcid;
+      }
+
+      if (enriched.hasFullText && enriched.fullText) {
+        doc.hasFullText = true;
+        doc.fullText = enriched.fullText;
+        doc.fullTextSections = enriched.fullTextSections;
+        doc.isOpenAccess = true;
+        // Re-extract PICO metrics prioritizing full-text Methods, Results, and Tables
+        doc.pico = extractPicoData(doc.title, doc.abstract, doc.fullTextSections, true);
+      } else {
+        doc.hasFullText = false;
+      }
+    }
+  } catch (err) {
+    console.warn('[searchService] PMC full-text enrichment notice:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -531,7 +700,7 @@ async function fetchPubMedSummaries(pmids: string[], keyParam: string): Promise<
     const result = data.result || {};
     const uids: string[] = result.uids || [];
 
-    return uids.map(uid => {
+    const docs: MedicalDocument[] = uids.map(uid => {
       const item = result[uid] || {};
       const title = (item.title || 'PubMed Clinical Study').replace(/\.$/, '');
       const authors = (item.authors || []).map((a: any) => a.name || 'Author');
@@ -539,9 +708,16 @@ async function fetchPubMedSummaries(pmids: string[], keyParam: string): Promise<
       const journal = item.fulljournalname || item.source || 'Medical Journal';
       const year = parseInt(item.pubdate?.slice(0, 4), 10) || new Date().getFullYear();
       let doi = '';
+      let pmcid: string | undefined;
       if (Array.isArray(item.articleids)) {
         const dObj = item.articleids.find((id: any) => id.idtype === 'doi');
         if (dObj) doi = dObj.value;
+        const pObj = item.articleids.find((id: any) => id.idtype === 'pmc');
+        if (pObj && pObj.value) {
+          pmcid = String(pObj.value).toUpperCase().startsWith('PMC')
+            ? String(pObj.value).toUpperCase()
+            : `PMC${pObj.value}`;
+        }
       }
 
       const abstract = `${title}. Published clinical analysis comparing outcomes, primary endpoints, and patient characteristics in ${journal}.`;
@@ -554,14 +730,19 @@ async function fetchPubMedSummaries(pmids: string[], keyParam: string): Promise<
         year,
         doi: doi || `10.1056/pubmed.${uid}`,
         pmid: uid,
+        pmcid,
+        hasFullText: false,
         abstract,
         citationCount: Math.floor(Math.random() * 100) + 15,
-        isOpenAccess: true,
+        isOpenAccess: Boolean(pmcid),
         source: 'PubMed',
         webUrl: `https://pubmed.ncbi.nlm.nih.gov/${uid}/`,
         pico: extractPicoData(title, abstract)
       };
     });
+
+    await applyPmcFullTextEnrichment(docs, 15);
+    return docs;
   } catch (err) {
     console.warn('[searchService] PubMed summary fallback warning:', err);
     return [];

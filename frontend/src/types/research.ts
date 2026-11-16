@@ -10,6 +10,13 @@ export interface PicoData {
   design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series';
 }
 
+export interface FullTextSections {
+  methods?: string;
+  results?: string;
+  tables?: string;
+  discussion?: string;
+}
+
 export interface MedicalDocument {
   id: string;
   title: string;
@@ -19,6 +26,10 @@ export interface MedicalDocument {
   year: number;
   doi: string;
   pmid?: string;
+  pmcid?: string;
+  hasFullText?: boolean;
+  fullText?: string;
+  fullTextSections?: FullTextSections;
   abstract: string;
   citationCount: number;
   isOpenAccess?: boolean;

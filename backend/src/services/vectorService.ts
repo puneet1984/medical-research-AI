@@ -78,6 +78,10 @@ export interface VectorStatus {
 // In-memory vector point with timestamp for FIFO rolling eviction
 interface MemoryPoint {
   id: string;
+  docKey: string;
+  chunkIndex: number;
+  totalChunks: number;
+  chunkText: string;
   vector: number[];
   payload: MedicalDocument;
   indexedAt: number;
@@ -100,6 +104,8 @@ let cachedSchemaVerification: QdrantSchemaVerification = {
     { field: 'indexedAt', type: 'integer', indexed: false, status: 'verified' },
     { field: 'doi', type: 'keyword', indexed: false, status: 'verified' },
     { field: 'pmid', type: 'keyword', indexed: false, status: 'verified' },
+    { field: 'pmcid', type: 'keyword', indexed: false, status: 'verified' },
+    { field: 'docId', type: 'keyword', indexed: false, status: 'verified' },
     { field: 'pico.design', type: 'keyword', indexed: false, status: 'verified' }
   ],
   allColumnsVerified: false,
@@ -130,7 +136,8 @@ export async function initQdrant(): Promise<boolean> {
     qdrantClient = new QdrantClient({
       url: config.qdrantUrl,
       apiKey: config.qdrantApiKey || undefined,
-      timeout: 3500
+      timeout: 3500,
+      checkCompatibility: false
     });
 
     // 1. Check if the database/collection exists
@@ -207,6 +214,8 @@ export async function initQdrant(): Promise<boolean> {
       { field: 'indexedAt', type: 'integer' }, // For rolling FIFO eviction
       { field: 'doi', type: 'keyword' },
       { field: 'pmid', type: 'keyword' },
+      { field: 'pmcid', type: 'keyword' },
+      { field: 'docId', type: 'keyword' },
       { field: 'pico.design', type: 'keyword' }
     ];
 
@@ -274,6 +283,8 @@ export async function initQdrant(): Promise<boolean> {
         { field: 'indexedAt', type: 'integer', indexed: true, status: 'verified' },
         { field: 'doi', type: 'keyword', indexed: true, status: 'verified' },
         { field: 'pmid', type: 'keyword', indexed: true, status: 'verified' },
+        { field: 'pmcid', type: 'keyword', indexed: true, status: 'verified' },
+        { field: 'docId', type: 'keyword', indexed: true, status: 'verified' },
         { field: 'pico.design', type: 'keyword', indexed: true, status: 'verified' }
       ],
       allColumnsVerified: true,
@@ -442,8 +453,54 @@ function performMemoryRollingEviction(newIncomingCount: number): number {
 }
 
 /**
+ * Splits a medical document into overlapping semantic chunks for vector embedding.
+ * When PMC `fullText` is available, chunks `fullText` into ~1400-char passages anchored
+ * with study title & metadata; otherwise embeds title + PICO summary + abstract.
+ */
+export function chunkDocumentForEmbedding(
+  doc: MedicalDocument,
+  chunkSize = 1400,
+  overlap = 200,
+  maxChunks = 12
+): string[] {
+  const headerAnchor = `${doc.title} (${doc.journal}, ${doc.year}). Intervention: ${doc.pico?.intervention || ''}. Population: ${doc.pico?.population || ''}. Outcome: ${doc.pico?.primaryOutcome || ''}.`;
+
+  if (!doc.hasFullText || !doc.fullText || doc.fullText.trim().length < 120) {
+    return [`${headerAnchor} ${doc.abstract || ''}`.trim()];
+  }
+
+  const normalizedBody = doc.fullText.replace(/\r\n/g, '\n').trim();
+  const chunks: string[] = [];
+  const step = Math.max(200, chunkSize - overlap);
+  let cursor = 0;
+
+  while (cursor < normalizedBody.length && chunks.length < maxChunks) {
+    let end = Math.min(normalizedBody.length, cursor + chunkSize);
+    if (end < normalizedBody.length) {
+      const slice = normalizedBody.slice(cursor, end);
+      const lastBreak = Math.max(slice.lastIndexOf('\n\n'), slice.lastIndexOf('. '));
+      if (lastBreak > Math.floor(chunkSize * 0.55)) {
+        end = cursor + lastBreak + 1;
+      }
+    }
+
+    const passage = normalizedBody.slice(cursor, end).trim();
+    if (passage.length > 0) {
+      const prefix = chunks.length === 0 ? `${headerAnchor} ${doc.abstract || ''}\n\n` : `${doc.title} (${doc.year}):\n`;
+      chunks.push(`${prefix}${passage}`.trim());
+    }
+
+    if (end >= normalizedBody.length) break;
+    cursor = Math.max(cursor + step, end - overlap);
+  }
+
+  return chunks.length > 0 ? chunks : [`${headerAnchor} ${doc.abstract || ''}`.trim()];
+}
+
+/**
  * Upserts a set of medical documents into the vector index permanently
- * with guaranteed Rolling Storage (FIFO auto-eviction of oldest records when capacity is reached).
+ * with full-text chunking (when PMC fullText is available) and guaranteed
+ * Rolling Storage (FIFO auto-eviction of oldest records when capacity is reached).
  */
 export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count: number; mode: 'qdrant' | 'local_in_memory'; evicted: number }> {
   if (!docs || docs.length === 0) {
@@ -452,71 +509,139 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
 
   const nowTimestamp = Date.now();
 
-  // 1. Rolling Storage FIFO enforcement
+  interface PendingChunk {
+    doc: MedicalDocument;
+    docKey: string;
+    chunkIndex: number;
+    totalChunks: number;
+    chunkText: string;
+    chunkKey: string;
+  }
+
+  const pendingChunks: PendingChunk[] = [];
+  for (const doc of docs) {
+    const docKey = (doc.doi || doc.pmid || doc.id).toLowerCase().trim();
+    const chunks = chunkDocumentForEmbedding(doc);
+
+    // Clear stale entries (old single-point or prior chunk count) for this document in memoryStore
+    memoryStore.delete(docKey);
+    for (const existingKey of Array.from(memoryStore.keys())) {
+      if (existingKey.startsWith(`${docKey}#chunk-`)) {
+        memoryStore.delete(existingKey);
+      }
+    }
+
+    chunks.forEach((chunkText, chunkIndex) => {
+      pendingChunks.push({
+        doc,
+        docKey,
+        chunkIndex,
+        totalChunks: chunks.length,
+        chunkText,
+        chunkKey: `${docKey}#chunk-${chunkIndex}`
+      });
+    });
+  }
+
+  // 1. Rolling Storage FIFO enforcement based on total vector points being upserted
   let evictedCount = 0;
   if (isQdrantReady && qdrantClient) {
-    evictedCount = await performQdrantRollingEviction(docs.length);
+    evictedCount = await performQdrantRollingEviction(pendingChunks.length);
   }
-  // Always maintain in-memory buffer within rolling capacity as well
-  evictedCount += performMemoryRollingEviction(docs.length);
+  evictedCount += performMemoryRollingEviction(pendingChunks.length);
 
-  // 2. Generate embeddings (supporting Ollama / OpenRouter / Hugging Face / local 384-d)
-  const pointsToUpsert = await Promise.all(
-    docs.map(async (doc) => {
-      const textChunk = `${doc.title} ${doc.pico?.intervention || ''} ${doc.pico?.population || ''} ${doc.pico?.primaryOutcome || ''} ${doc.abstract}`;
-      const { vector } = await generateEmbeddingAsync(textChunk);
-      
-      const pointKey = (doc.doi || doc.pmid || doc.id).toLowerCase().trim();
+  // 2. Generate embeddings with bounded concurrency (batches of 10) to respect API limits
+  const pointsToUpsert: Array<{ id: number; vector: number[]; payload: Record<string, any> }> = [];
+  const EMBED_CONCURRENCY = 10;
 
-      // Store in persistent in-memory map with timestamp for FIFO rolling eviction
-      memoryStore.set(pointKey, {
-        id: doc.id,
-        vector,
-        payload: doc,
-        indexedAt: nowTimestamp
-      });
+  for (let i = 0; i < pendingChunks.length; i += EMBED_CONCURRENCY) {
+    const slice = pendingChunks.slice(i, i + EMBED_CONCURRENCY);
+    const embeddedBatch = await Promise.all(
+      slice.map(async (item) => {
+        const { vector } = await generateEmbeddingAsync(item.chunkText);
+        const { doc, docKey, chunkIndex, totalChunks, chunkText, chunkKey } = item;
 
-      return {
-        id: deterministicPointId(pointKey), // Deterministic ID ensures idempotent updates in Qdrant
-        vector,
-        payload: {
+        memoryStore.set(chunkKey, {
+          id: doc.id,
+          docKey,
+          chunkIndex,
+          totalChunks,
+          chunkText,
+          vector,
+          payload: doc,
+          indexedAt: nowTimestamp
+        });
+
+        const payload: Record<string, any> = {
           docId: doc.id,
+          docKey,
+          chunkIndex,
+          totalChunks,
+          chunkText,
           title: doc.title,
           authors: doc.authors,
+          firstAuthor: doc.firstAuthor,
           journal: doc.journal,
           year: doc.year,
           doi: doc.doi,
           pmid: doc.pmid,
+          pmcid: doc.pmcid,
+          hasFullText: Boolean(doc.hasFullText),
           abstract: doc.abstract,
           pico: doc.pico,
           citationCount: doc.citationCount,
           source: doc.source,
           isOpenAccess: doc.isOpenAccess,
           webUrl: doc.webUrl,
-          indexedAt: nowTimestamp // Crucial for rolling storage FIFO queries
-        }
-      };
-    })
-  );
+          indexedAt: nowTimestamp
+        };
 
-  // 3. Attempt upsert to Qdrant if active
+        // Store fullText & structured sections on chunk 0 to preserve full data without multiplying REST payload size
+        if (chunkIndex === 0 && doc.hasFullText && doc.fullText) {
+          payload.fullText = doc.fullText;
+          if (doc.fullTextSections) {
+            payload.fullTextSections = doc.fullTextSections;
+          }
+        }
+
+        return {
+          id: deterministicPointId(chunkKey),
+          vector,
+          payload
+        };
+      })
+    );
+    pointsToUpsert.push(...embeddedBatch);
+  }
+
+  // 3. Attempt batched upsert to Qdrant if active
   if (isQdrantReady && qdrantClient) {
+    const UPSERT_BATCH_SIZE = 50;
     try {
-      await qdrantClient.upsert(COLLECTION_NAME, {
-        wait: true,
-        points: pointsToUpsert
-      });
+      for (let i = 0; i < pointsToUpsert.length; i += UPSERT_BATCH_SIZE) {
+        const batch = pointsToUpsert.slice(i, i + UPSERT_BATCH_SIZE);
+        await qdrantClient.upsert(COLLECTION_NAME, {
+          wait: true,
+          points: batch
+        });
+      }
       return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
     } catch (err: any) {
       if (isQdrantOverlimitError(err)) {
         console.warn(`[vectorService] Qdrant reported OVERLIMIT condition (${err?.message || err}). Triggering emergency rolling FIFO eviction of oldest records...`);
-        const emergencyEvicted = await performQdrantRollingEviction(docs.length, Math.max(docs.length * 2, 50));
+        const emergencyEvicted = await performQdrantRollingEviction(
+          pointsToUpsert.length,
+          Math.max(pointsToUpsert.length * 2, 50)
+        );
         evictedCount += emergencyEvicted;
         try {
-          await qdrantClient.upsert(COLLECTION_NAME, {
-            wait: true,
-            points: pointsToUpsert
-          });
+          for (let i = 0; i < pointsToUpsert.length; i += UPSERT_BATCH_SIZE) {
+            const batch = pointsToUpsert.slice(i, i + UPSERT_BATCH_SIZE);
+            await qdrantClient.upsert(COLLECTION_NAME, {
+              wait: true,
+              points: batch
+            });
+          }
           console.log(`[vectorService] Successfully recovered: Qdrant upsert completed after emergency rolling eviction of ${emergencyEvicted} points.`);
           return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
         } catch (retryErr) {
@@ -540,10 +665,12 @@ export async function findCachedSimilar(query: string, minScore = 0.45, limit = 
 }
 
 /**
- * Searches similar documents given a query string
+ * Searches similar documents given a query string, deduplicating multi-chunk hits
+ * back to unique studies while keeping each study's highest semantic similarity score.
  */
 export async function searchSimilar(query: string, limit = 25): Promise<VectorSearchResult[]> {
   const { vector: queryVector } = await generateEmbeddingAsync(query);
+  const candidateLimit = Math.min(200, Math.max(limit * 4, 40));
 
   if (isQdrantReady && qdrantClient) {
     try {
@@ -551,33 +678,43 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
       const qdrantResults: any[] = typeof clientAny.search === 'function'
         ? await clientAny.search(COLLECTION_NAME, {
             vector: queryVector,
-            limit,
+            limit: candidateLimit,
             with_payload: true
           })
         : typeof clientAny.query === 'function'
         ? (await clientAny.query(COLLECTION_NAME, {
             query: queryVector,
-            limit,
+            limit: candidateLimit,
             with_payload: true
           }))?.points || []
         : [];
 
       if (qdrantResults && qdrantResults.length > 0) {
-        return qdrantResults.map((hit: any) => {
-          const p = hit.payload as any;
+        const deduped = new Map<string, VectorSearchResult>();
+
+        for (const hit of qdrantResults) {
+          const p = (hit.payload || {}) as any;
+          const dedupKey = String(p.docKey || p.docId || p.doi || p.pmid || hit.id).toLowerCase().trim();
+          const existing = deduped.get(dedupKey);
+
           const doc: MedicalDocument = {
             id: p.docId || String(hit.id),
             title: p.title || 'Untitled',
             authors: p.authors || [],
-            firstAuthor: (p.authors && p.authors[0]) || 'Author',
+            firstAuthor: p.firstAuthor || (p.authors && p.authors[0]) || 'Author',
             journal: p.journal || 'Journal',
             year: p.year || 2023,
             doi: p.doi || '',
             pmid: p.pmid,
+            pmcid: p.pmcid,
+            hasFullText: p.hasFullText,
+            fullText: p.fullText,
+            fullTextSections: p.fullTextSections,
             abstract: p.abstract || '',
             citationCount: p.citationCount || 0,
             isOpenAccess: p.isOpenAccess ?? true,
-            source: p.source || 'OpenAlex',
+            source: p.source || 'PubMed',
+            webUrl: p.webUrl,
             pico: p.pico || {
               population: '',
               sampleSize: 0,
@@ -589,24 +726,50 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
             },
             score: hit.score
           };
-          return { document: doc, score: hit.score };
-        });
+
+          if (!existing) {
+            deduped.set(dedupKey, { document: doc, score: hit.score });
+          } else {
+            if (hit.score > existing.score) {
+              existing.score = hit.score;
+              existing.document.score = hit.score;
+            }
+            if (!existing.document.fullText && doc.fullText) {
+              existing.document.fullText = doc.fullText;
+            }
+            if (!existing.document.fullTextSections && doc.fullTextSections) {
+              existing.document.fullTextSections = doc.fullTextSections;
+            }
+            if (!existing.document.pmcid && doc.pmcid) {
+              existing.document.pmcid = doc.pmcid;
+            }
+          }
+        }
+
+        const merged = Array.from(deduped.values());
+        merged.sort((a, b) => b.score - a.score);
+        return merged.slice(0, limit);
       }
     } catch (err) {
       console.warn('[vectorService] Qdrant search failed, falling back to memory search:', err);
     }
   }
 
-  // Local in-memory cosine ranking fallback
-  const scored: VectorSearchResult[] = [];
+  // Local in-memory cosine ranking fallback (deduplicating chunks per document)
+  const dedupedMemory = new Map<string, VectorSearchResult>();
   for (const point of memoryStore.values()) {
     const score = cosineSimilarity(queryVector, point.vector);
-    scored.push({
-      document: { ...point.payload, score },
-      score
-    });
+    const dedupKey = point.docKey || (point.payload.doi || point.payload.pmid || point.payload.id).toLowerCase().trim();
+    const existing = dedupedMemory.get(dedupKey);
+    if (!existing || score > existing.score) {
+      dedupedMemory.set(dedupKey, {
+        document: { ...point.payload, score },
+        score
+      });
+    }
   }
 
+  const scored = Array.from(dedupedMemory.values());
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
 }

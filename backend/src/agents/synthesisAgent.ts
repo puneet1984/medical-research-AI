@@ -79,18 +79,21 @@ export async function synthesizeLiterature(
   // Format context for prompt with explicit citation keys
   const contextFormatted = documents.slice(0, 8).map((doc, idx) => {
     const citationKey = `[${doc.firstAuthor}, ${doc.year} (${doc.doi || 'DOI'})]`;
+    const fullTextExcerpt = doc.hasFullText && doc.fullText
+      ? `\n- PMC Open-Access Full-Text Excerpt (${doc.pmcid || 'PMC'}):\n${doc.fullText.slice(0, 3500)}`
+      : '';
     return `### Source ${idx + 1}: ${citationKey}
 - Title: ${doc.title}
 - Authors: ${doc.authors.slice(0, 5).join(', ')} et al.
 - Journal: ${doc.journal} (${doc.year})
-- DOI: ${doc.doi}
+- DOI: ${doc.doi}${doc.pmid ? ` | PMID: ${doc.pmid}` : ''}${doc.pmcid ? ` | PMCID: ${doc.pmcid}` : ''}
 - Study Design: ${doc.pico.design}
 - Population (N): ${doc.pico.population} (N = ${doc.pico.sampleSize})
 - Intervention: ${doc.pico.intervention}
 - Comparator: ${doc.pico.comparator}
 - Outcome: ${doc.pico.primaryOutcome}
-- Quantitative Metrics: ${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.pValues.join(', ')}
-- Abstract: ${doc.abstract}
+- Quantitative Metrics: ${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.riskRatio ? `RR: ${doc.pico.riskRatio}, ` : ''}${doc.pico.pValues.join(', ')}
+- Abstract: ${doc.abstract}${fullTextExcerpt}
 `;
   }).join('\n---\n');
 

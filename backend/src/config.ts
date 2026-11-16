@@ -51,6 +51,17 @@ try {
   console.warn('[config] Notice creating data directory:', err);
 }
 
+function syncScholarlyEnvVars(): void {
+  if (config.ncbiApiKey) {
+    process.env.NCBI_API_KEY = config.ncbiApiKey;
+  } else {
+    delete process.env.NCBI_API_KEY;
+  }
+  if (config.scholarlyEmail) {
+    process.env.SCHOLARLY_USER_AGENT_EMAIL = config.scholarlyEmail;
+  }
+}
+
 // Load persistent settings on startup from mounted volume if file exists
 function loadPersistentSettings(): void {
   try {
@@ -69,6 +80,7 @@ function loadPersistentSettings(): void {
   } catch (err) {
     console.warn('[config] Could not read persistent settings file:', err);
   }
+  syncScholarlyEnvVars();
 }
 
 loadPersistentSettings();
@@ -132,6 +144,7 @@ export function updateRuntimeConfig(updates: Record<string, unknown>): typeof co
       (config as Record<string, unknown>)[k] = v;
     }
   }
+  syncScholarlyEnvVars();
   savePersistentSettings();
   return config;
 }
