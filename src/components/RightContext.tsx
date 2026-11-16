@@ -18,9 +18,29 @@ import {
   HardDrive,
   RefreshCw,
   AlertTriangle,
-  Info
+  Info,
+  Sparkles,
+  BookOpen
 } from 'lucide-react';
 import { MedicalDocument, VectorStatusInfo } from '../types/research';
+
+interface LinkedPubMedArticle {
+  pmid: string;
+  title: string;
+  firstAuthor: string;
+  journal: string;
+  year: number;
+  doi: string;
+  webUrl: string;
+}
+
+interface RelatedArticlesState {
+  loading: boolean;
+  open: boolean;
+  error?: string;
+  relatedArticles: LinkedPubMedArticle[];
+  citingArticles: LinkedPubMedArticle[];
+}
 
 interface RightContextProps {
   documents: MedicalDocument[];
@@ -48,6 +68,13 @@ const getSourceBadgeClass = (source: string) => {
       return 'bg-orange-50 text-orange-700 border-orange-200';
     case 'Google Search':
       return 'bg-sky-50 text-sky-700 border-sky-200';
+    case 'ClinicalTrials.gov':
+    case 'ClinicalTrials':
+      return 'bg-cyan-50 text-cyan-800 border-cyan-200';
+    case 'ISRCTN':
+      return 'bg-violet-50 text-violet-800 border-violet-200';
+    case 'Crossref':
+      return 'bg-slate-100 text-slate-700 border-slate-300';
     default:
       return 'bg-indigo-50 text-indigo-700 border-indigo-200';
   }
@@ -68,6 +95,7 @@ export const RightContext: React.FC<RightContextProps> = ({
   const [sortOrder, setSortOrder] = useState<'recent' | 'relevance' | 'citations' | 'sample'>('recent');
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [relatedByPmid, setRelatedByPmid] = useState<Record<string, RelatedArticlesState>>({});
 
   // Sort extracted sources: Recent to Past is the default
   const sortedDocuments = useMemo(() => {
@@ -95,8 +123,17 @@ export const RightContext: React.FC<RightContextProps> = ({
     });
   };
 
+  const formatAuthorShort = (doc: MedicalDocument) => {
+    if (doc.authors && doc.authors.length > 0) {
+      return `${doc.firstAuthor || doc.authors[0]}${doc.authors.length > 1 ? ' et al.' : ''}`;
+    }
+    return doc.firstAuthor || doc.journal;
+  };
+
   const handleCopyCitation = (doc: MedicalDocument) => {
-    const citation = `${doc.firstAuthor} et al. (${doc.year}). ${doc.title}. ${doc.journal}. DOI: https://doi.org/${doc.doi} [${doc.source}]`;
+    const authorPart = doc.authors && doc.authors.length > 0 ? `${formatAuthorShort(doc)} ` : '';
+    const doiPart = doc.doi ? ` DOI: https://doi.org/${doc.doi}` : '';
+    const citation = `${authorPart}(${doc.year}). ${doc.title}. ${doc.journal}.${doiPart} [${doc.source}]`;
     navigator.clipboard.writeText(citation);
     setCopiedId(doc.id);
     setTimeout(() => setCopiedId(null), 2000);
@@ -106,7 +143,7 @@ export const RightContext: React.FC<RightContextProps> = ({
     const headers = ['Source Database', 'Study', 'Year', 'Journal', 'Design', 'Sample Size (N)', 'Population', 'Intervention', 'Comparator', 'Primary Outcome', 'Effect Size (HR)', 'p-Values', 'DOI', 'Web URL'];
     const rows = documents.map(d => [
       `"${d.source}"`,
-      `"${d.firstAuthor} et al."`,
+      `"${formatAuthorShort(d).replace(/"/g, '""')}"`,
       d.year,
       `"${d.journal.replace(/"/g, '""')}"`,
       `"${d.pico.design}"`,
@@ -129,6 +166,123 @@ export const RightContext: React.FC<RightContextProps> = ({
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const triggerTextDownload = (content: string, filename: string, mimeType: string) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportRis = () => {
+    const risRecords = sortedDocuments.map(d => {
+      const lines: string[] = [
+        'TY  - JOUR',
+        `TI  - ${d.title.replace(/\r?\n/g, ' ')}`
+      ];
+      if (d.authors && d.authors.length > 0) {
+        d.authors.forEach(a => lines.push(`AU  - ${a}`));
+      } else if (d.firstAuthor) {
+        lines.push(`AU  - ${d.firstAuthor}`);
+      }
+      lines.push(`JO  - ${d.journal}`);
+      lines.push(`PY  - ${d.year}`);
+      if (d.doi) lines.push(`DO  - ${d.doi}`);
+      if (d.pmid) lines.push(`AN  - PMID:${d.pmid}`);
+      if (d.nctId) lines.push(`N1  - ClinicalTrials.gov: ${d.nctId}`);
+      if (d.isrctnId) lines.push(`N1  - ISRCTN: ${d.isrctnId}`);
+      if (d.abstract) lines.push(`AB  - ${d.abstract.replace(/\r?\n/g, ' ')}`);
+      const url = d.webUrl || (d.doi ? `https://doi.org/${d.doi}` : '');
+      if (url) lines.push(`UR  - ${url}`);
+      lines.push('ER  - ');
+      return lines.join('\n');
+    });
+    triggerTextDownload(
+      risRecords.join('\n'),
+      `MedResearch_Citations_${new Date().toISOString().split('T')[0]}.ris`,
+      'application/x-research-info-systems;charset=utf-8'
+    );
+  };
+
+  const handleExportBibtex = () => {
+    const bibRecords = sortedDocuments.map((d, idx) => {
+      const authorBase = (d.firstAuthor || d.journal || 'study').replace(/[^a-zA-Z0-9]/g, '').slice(0, 14) || 'study';
+      const citeKey = `${authorBase}${d.year}_${d.pmid || idx + 1}`;
+      const authorStr = d.authors && d.authors.length > 0 ? d.authors.join(' and ') : (d.firstAuthor || d.journal);
+      const escapeBib = (val: string) => val.replace(/[{}\\]/g, '').replace(/\r?\n/g, ' ').trim();
+      const fields: string[] = [
+        `  author = {${escapeBib(authorStr)}}`,
+        `  title = {{${escapeBib(d.title)}}}`,
+        `  journal = {${escapeBib(d.journal)}}`,
+        `  year = {${d.year}}`
+      ];
+      if (d.doi) fields.push(`  doi = {${escapeBib(d.doi)}}`);
+      if (d.pmid) fields.push(`  pmid = {${d.pmid}}`);
+      const url = d.webUrl || (d.doi ? `https://doi.org/${d.doi}` : '');
+      if (url) fields.push(`  url = {${escapeBib(url)}}`);
+      const noteParts = [d.source, d.nctId, d.isrctnId].filter(Boolean);
+      if (noteParts.length > 0) fields.push(`  note = {${escapeBib(noteParts.join(' | '))}}`);
+      return `@article{${citeKey},\n${fields.join(',\n')}\n}`;
+    });
+    triggerTextDownload(
+      bibRecords.join('\n\n'),
+      `MedResearch_Citations_${new Date().toISOString().split('T')[0]}.bib`,
+      'application/x-bibtex;charset=utf-8'
+    );
+  };
+
+  const handleFindSimilarNcbi = async (e: React.MouseEvent, pmid: string) => {
+    e.stopPropagation();
+    const existing = relatedByPmid[pmid];
+    if (existing && !existing.loading && (existing.relatedArticles.length > 0 || existing.citingArticles.length > 0 || existing.error)) {
+      setRelatedByPmid(prev => ({
+        ...prev,
+        [pmid]: { ...prev[pmid], open: !prev[pmid].open }
+      }));
+      return;
+    }
+
+    setRelatedByPmid(prev => ({
+      ...prev,
+      [pmid]: {
+        loading: true,
+        open: true,
+        relatedArticles: [],
+        citingArticles: []
+      }
+    }));
+
+    try {
+      const res = await fetch(`/api/articles/${encodeURIComponent(pmid)}/related?limit=6`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setRelatedByPmid(prev => ({
+        ...prev,
+        [pmid]: {
+          loading: false,
+          open: true,
+          relatedArticles: Array.isArray(data.relatedArticles) ? data.relatedArticles : [],
+          citingArticles: Array.isArray(data.citingArticles) ? data.citingArticles : []
+        }
+      }));
+    } catch (err) {
+      setRelatedByPmid(prev => ({
+        ...prev,
+        [pmid]: {
+          loading: false,
+          open: true,
+          error: err instanceof Error ? err.message : 'Failed to load related articles',
+          relatedArticles: [],
+          citingArticles: []
+        }
+      }));
+    }
   };
 
   return (
@@ -175,6 +329,27 @@ export const RightContext: React.FC<RightContextProps> = ({
             <span>Vector Index &amp; DB</span>
           </button>
         </div>
+
+        {activeTab === 'sources' && documents.length > 0 && (
+          <div className="flex items-center gap-1 pb-1">
+            <button
+              onClick={handleExportRis}
+              className="flex items-center gap-1 text-[10px] font-medium text-slate-700 hover:text-teal-900 bg-slate-50 hover:bg-teal-50 border border-slate-200 hover:border-teal-200 px-2 py-1 rounded-md transition-colors cursor-pointer"
+              title="Export references to .RIS (Zotero / EndNote)"
+            >
+              <Download className="w-3 h-3" />
+              <span>Export .RIS</span>
+            </button>
+            <button
+              onClick={handleExportBibtex}
+              className="flex items-center gap-1 text-[10px] font-medium text-slate-700 hover:text-teal-900 bg-slate-50 hover:bg-teal-50 border border-slate-200 hover:border-teal-200 px-2 py-1 rounded-md transition-colors cursor-pointer"
+              title="Export references to .BibTeX"
+            >
+              <BookOpen className="w-3 h-3" />
+              <span>Export .BibTeX</span>
+            </button>
+          </div>
+        )}
 
         {activeTab === 'pico' && documents.length > 0 && (
           <button
@@ -307,6 +482,10 @@ export const RightContext: React.FC<RightContextProps> = ({
                             ? 'bg-purple-50 text-purple-700 border border-purple-200'
                             : doc.pico.design === 'Case Report' || doc.pico.design === 'Case Series'
                             ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                            : doc.pico.design === 'Preclinical / Experimental Study'
+                            ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                            : doc.pico.design === 'Consensus / Classification Paper'
+                            ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                         }`}>
                           {doc.pico.design}
@@ -315,6 +494,42 @@ export const RightContext: React.FC<RightContextProps> = ({
                         {doc.isOpenAccess && (
                           <span className="text-[10px] font-medium bg-teal-50 text-teal-700 border border-teal-200 px-1.5 py-0.2 rounded">
                             Open Access
+                          </span>
+                        )}
+
+                        {doc.hasFullText && (
+                          <span
+                            className="text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.2 rounded"
+                            title={doc.pmcid ? `PMC Open-Access Full Text (${doc.pmcid})` : 'PMC Open-Access Full Text Parsed'}
+                          >
+                            PMC Full Text
+                          </span>
+                        )}
+
+                        {(doc.nctVerified || doc.nctId) && (
+                          <span
+                            className="text-[10px] font-semibold bg-cyan-50 text-cyan-800 border border-cyan-200 px-1.5 py-0.2 rounded"
+                            title={doc.nctId ? `Verified ClinicalTrials.gov Trial (${doc.nctId})` : 'ClinicalTrials.gov Verified'}
+                          >
+                            NCT Verified{doc.nctId ? ` (${doc.nctId})` : ''}
+                          </span>
+                        )}
+
+                        {(doc.isrctnVerified || doc.isrctnId) && (
+                          <span
+                            className="text-[10px] font-semibold bg-violet-50 text-violet-800 border border-violet-200 px-1.5 py-0.2 rounded"
+                            title={doc.isrctnId ? `Verified ISRCTN Trial (${doc.isrctnId})` : 'ISRCTN Registry Verified'}
+                          >
+                            ISRCTN Verified{doc.isrctnId ? ` (${doc.isrctnId})` : ''}
+                          </span>
+                        )}
+
+                        {doc.mergedSources && doc.mergedSources.length > 1 && (
+                          <span
+                            className="text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200 px-1.5 py-0.2 rounded"
+                            title={`Cross-source merged record: ${doc.mergedSources.join(', ')}`}
+                          >
+                            +{doc.mergedSources.length - 1} merged
                           </span>
                         )}
                       </div>
@@ -349,8 +564,12 @@ export const RightContext: React.FC<RightContextProps> = ({
 
                     {/* Authors & Journal */}
                     <div className="mt-1 text-[11px] text-slate-500 flex items-center gap-1.5 flex-wrap">
-                      <span className="font-medium text-slate-700">{doc.firstAuthor} et al.</span>
-                      <span>•</span>
+                      {doc.authors && doc.authors.length > 0 && (
+                        <>
+                          <span className="font-medium text-slate-700">{doc.firstAuthor}{doc.authors.length > 1 ? ' et al.' : ''}</span>
+                          <span>•</span>
+                        </>
+                      )}
                       <span className="italic text-slate-600">{doc.journal}</span>
                     </div>
 
@@ -422,6 +641,45 @@ export const RightContext: React.FC<RightContextProps> = ({
                             </a>
                           )}
 
+                          {doc.pmcid && (
+                            <a
+                              href={`https://pmc.ncbi.nlm.nih.gov/articles/${doc.pmcid}/`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              className="inline-flex items-center gap-1 text-emerald-700 hover:text-emerald-900 font-medium hover:underline"
+                            >
+                              <span>{doc.pmcid}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+
+                          {doc.nctId && (
+                            <a
+                              href={`https://clinicaltrials.gov/study/${doc.nctId}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              className="inline-flex items-center gap-1 text-cyan-700 hover:text-cyan-900 font-medium hover:underline"
+                            >
+                              <span>{doc.nctId}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+
+                          {doc.isrctnId && (
+                            <a
+                              href={`https://www.isrctn.com/${doc.isrctnId}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              className="inline-flex items-center gap-1 text-violet-700 hover:text-violet-900 font-medium hover:underline"
+                            >
+                              <span>{doc.isrctnId}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+
                           {doc.webUrl && (
                             <a
                               href={doc.webUrl}
@@ -449,8 +707,130 @@ export const RightContext: React.FC<RightContextProps> = ({
                       </div>
                     )}
 
-                    {/* Toggle expand button */}
-                    <div className="mt-2 flex justify-end">
+                    {/* Expandable Related & Citing Articles (NCBI elink) panel */}
+                    {doc.pmid && relatedByPmid[doc.pmid]?.open && (
+                      <div
+                        onClick={e => e.stopPropagation()}
+                        className="mt-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-md space-y-2 text-[11px]"
+                      >
+                        <div className="flex items-center justify-between border-b border-slate-200 pb-1">
+                          <span className="font-semibold text-slate-700 flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-teal-600" />
+                            NCBI Citation &amp; Related Network (PMID:{doc.pmid})
+                          </span>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setRelatedByPmid(prev => ({
+                                ...prev,
+                                [doc.pmid!]: { ...prev[doc.pmid!], open: false }
+                              }));
+                            }}
+                            className="text-[10px] text-slate-400 hover:text-slate-700 cursor-pointer"
+                          >
+                            Close
+                          </button>
+                        </div>
+
+                        {relatedByPmid[doc.pmid]?.loading ? (
+                          <div className="py-2 text-slate-500 flex items-center gap-1.5">
+                            <RefreshCw className="w-3 h-3 animate-spin text-teal-600" />
+                            <span>Querying NCBI Entrez elink...</span>
+                          </div>
+                        ) : relatedByPmid[doc.pmid]?.error ? (
+                          <div className="text-rose-600 text-[10px]">
+                            Unable to load NCBI linked articles: {relatedByPmid[doc.pmid].error}
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            {relatedByPmid[doc.pmid].relatedArticles.length > 0 && (
+                              <div>
+                                <div className="text-[10px] font-bold uppercase tracking-wider text-teal-800 mb-1">
+                                  Similar Articles (pubmed_pubmed)
+                                </div>
+                                <ul className="space-y-1">
+                                  {relatedByPmid[doc.pmid].relatedArticles.map(art => (
+                                    <li key={`rel-${art.pmid}`} className="flex items-start justify-between gap-2 bg-white p-1.5 rounded border border-slate-200/70">
+                                      <div className="min-w-0">
+                                        <a
+                                          href={art.webUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-medium text-slate-800 hover:text-teal-700 hover:underline line-clamp-1"
+                                        >
+                                          {art.title}
+                                        </a>
+                                        <div className="text-[10px] text-slate-500">
+                                          {art.firstAuthor} ({art.year}) • {art.journal}
+                                        </div>
+                                      </div>
+                                      <span className="font-mono text-[9px] text-blue-700 bg-blue-50 px-1 py-0.5 rounded shrink-0">
+                                        PMID:{art.pmid}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+
+                            {relatedByPmid[doc.pmid].citingArticles.length > 0 && (
+                              <div>
+                                <div className="text-[10px] font-bold uppercase tracking-wider text-indigo-800 mb-1">
+                                  Cited By (pubmed_pubmed_citedin)
+                                </div>
+                                <ul className="space-y-1">
+                                  {relatedByPmid[doc.pmid].citingArticles.map(art => (
+                                    <li key={`cit-${art.pmid}`} className="flex items-start justify-between gap-2 bg-white p-1.5 rounded border border-slate-200/70">
+                                      <div className="min-w-0">
+                                        <a
+                                          href={art.webUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-medium text-slate-800 hover:text-indigo-700 hover:underline line-clamp-1"
+                                        >
+                                          {art.title}
+                                        </a>
+                                        <div className="text-[10px] text-slate-500">
+                                          {art.firstAuthor} ({art.year}) • {art.journal}
+                                        </div>
+                                      </div>
+                                      <span className="font-mono text-[9px] text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded shrink-0">
+                                        PMID:{art.pmid}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+
+                            {relatedByPmid[doc.pmid].relatedArticles.length === 0 &&
+                              relatedByPmid[doc.pmid].citingArticles.length === 0 && (
+                                <p className="text-[10px] text-slate-500 italic">
+                                  No related or citing PubMed articles returned by NCBI elink for this PMID.
+                                </p>
+                              )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Action footer: Find Similar (NCBI) + Toggle expand */}
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <div>
+                        {doc.pmid && (
+                          <button
+                            onClick={(e) => handleFindSimilarNcbi(e, doc.pmid!)}
+                            className="text-[11px] font-medium text-teal-700 hover:text-teal-900 bg-teal-50/70 hover:bg-teal-100/70 border border-teal-200/80 px-2 py-0.5 rounded flex items-center gap-1 cursor-pointer transition-colors"
+                            title="Discover similar and citing PubMed articles via NCBI Entrez elink"
+                          >
+                            <Sparkles className="w-3 h-3" />
+                            <span>
+                              {relatedByPmid[doc.pmid]?.open ? 'Hide Similar (NCBI)' : 'Find Similar (NCBI)'}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -559,7 +939,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                         </span>
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
-                        <div className="font-semibold text-slate-900">{doc.firstAuthor}</div>
+                        <div className="font-semibold text-slate-900">{doc.firstAuthor || doc.journal}</div>
                         <div className="text-[10px] text-slate-500">{doc.year} • {doc.journal.slice(0, 16)}...</div>
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
@@ -570,6 +950,10 @@ export const RightContext: React.FC<RightContextProps> = ({
                             ? 'bg-purple-50 text-purple-700 border border-purple-200'
                             : doc.pico.design === 'Case Report' || doc.pico.design === 'Case Series'
                             ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                            : doc.pico.design === 'Preclinical / Experimental Study'
+                            ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                            : doc.pico.design === 'Consensus / Classification Paper'
+                            ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                         }`}>
                           {doc.pico.design === 'Randomized Controlled Trial' ? 'RCT' : doc.pico.design}

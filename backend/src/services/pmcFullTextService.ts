@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { apiCache } from '../utils/apiCache.js';
 
 export interface FullTextSections {
   methods?: string;
@@ -323,13 +324,30 @@ export async function resolvePmcIds(pmids: string[]): Promise<Record<string, str
   if (uniquePmids.length === 0) return {};
 
   const pmidToPmcid: Record<string, string> = {};
+  const uncachedPmids: string[] = [];
+
+  for (const pmid of uniquePmids) {
+    const cached = apiCache.get<{ pmcid: string | null }>(`pmc:idconv:${pmid}`);
+    if (cached !== undefined) {
+      if (cached.pmcid) {
+        pmidToPmcid[pmid] = cached.pmcid;
+      }
+    } else {
+      uncachedPmids.push(pmid);
+    }
+  }
+
+  if (uncachedPmids.length === 0) {
+    return pmidToPmcid;
+  }
+
   const { apiKey, email } = getNcbiCredentials();
   const keyParam = apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : '';
 
   // NCBI ID Converter API accepts up to 200 IDs per batch
   const BATCH_SIZE = 150;
-  for (let i = 0; i < uniquePmids.length; i += BATCH_SIZE) {
-    const batch = uniquePmids.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < uncachedPmids.length; i += BATCH_SIZE) {
+    const batch = uncachedPmids.slice(i, i + BATCH_SIZE);
     try {
       await waitForNcbiPmcRateLimit();
       const url = `${NCBI_ID_CONVERTER_URL}?ids=${batch.join(',')}&format=json&tool=${TOOL_NAME}&email=${encodeURIComponent(email)}${keyParam}`;
@@ -348,13 +366,23 @@ export async function resolvePmcIds(pmids: string[]): Promise<Record<string, str
 
       const data = (await res.json()) as { records?: any[] };
       const records = Array.isArray(data?.records) ? data.records : [];
+      const resolvedInBatch = new Set<string>();
       for (const rec of records) {
         if (rec && rec.pmcid && rec.status !== 'error') {
           const requestedId = String(rec['requested-id'] || rec.pmid || '').trim();
           const pmcid = String(rec.pmcid).trim();
           if (requestedId && /^PMC\d+$/i.test(pmcid)) {
-            pmidToPmcid[requestedId] = pmcid.toUpperCase();
+            const upperPmc = pmcid.toUpperCase();
+            pmidToPmcid[requestedId] = upperPmc;
+            resolvedInBatch.add(requestedId);
+            apiCache.set(`pmc:idconv:${requestedId}`, { pmcid: upperPmc });
           }
+        }
+      }
+      // Negatively cache non-PMC PMIDs from successful API batches for 24h to avoid redundant hits
+      for (const pmid of batch) {
+        if (!resolvedInBatch.has(pmid)) {
+          apiCache.set(`pmc:idconv:${pmid}`, { pmcid: null });
         }
       }
     } catch (err) {
@@ -370,7 +398,7 @@ export async function resolvePmcIds(pmids: string[]): Promise<Record<string, str
  * structured clinical sections (`methods`, `results`, `tables`, `discussion`)
  * and a prioritized `fullText` string capped at `maxCharsPerArticle`.
  *
- * Strictly complies with NCBI Entrez Usage Guidelines (NBK25497).
+ * Strictly complies with NCBI Entrez Usage Guidelines (NBK25497) and 24h apiCache.
  * Gracefully handles paywalled, non-PMC, or HTTP-failed articles with `hasFullText: false`.
  */
 export async function enrichArticlesWithFullText(
@@ -388,15 +416,22 @@ export async function enrichArticlesWithFullText(
 
   if (uniquePmids.length === 0) return results;
 
-  // 1. Batch-map PMIDs -> PMCIDs
+  // 1. Batch-map PMIDs -> PMCIDs (backed by 24h TTL cache)
   const pmidToPmcid = await resolvePmcIds(uniquePmids);
   const pmcidToPmid: Record<string, string> = {};
   const pmcIdsToFetch: string[] = [];
 
   for (const [pmid, pmcid] of Object.entries(pmidToPmcid)) {
-    results[pmid] = { pmid, pmcid, hasFullText: false };
-    pmcidToPmid[pmcid.toUpperCase()] = pmid;
-    pmcIdsToFetch.push(pmcid.toUpperCase());
+    const upperPmc = pmcid.toUpperCase();
+    const cachedArticle = apiCache.get<PmcEnrichmentResult>(`pmc:efetch:${upperPmc}:${maxCharsPerArticle}`);
+    if (cachedArticle) {
+      results[pmid] = { ...cachedArticle, pmid, pmcid: cachedArticle.pmcid || upperPmc };
+      continue;
+    }
+
+    results[pmid] = { pmid, pmcid: upperPmc, hasFullText: false };
+    pmcidToPmid[upperPmc] = pmid;
+    pmcIdsToFetch.push(upperPmc);
   }
 
   if (pmcIdsToFetch.length === 0) {
@@ -432,6 +467,7 @@ export async function enrichArticlesWithFullText(
         continue;
       }
 
+      const cachedInBatch = new Set<string>();
       const articleMatches = xmlText.matchAll(/<article\b[^>]*>[\s\S]*?<\/article>/gi);
       for (const artMatch of articleMatches) {
         const articleXml = artMatch[0];
@@ -449,15 +485,43 @@ export async function enrichArticlesWithFullText(
 
         if (!targetPmid) continue;
 
+        const resolvedPmcid = parsedPmcid || results[targetPmid].pmcid;
         const parsed = parsePmcArticleXml(articleXml, maxCharsPerArticle);
         if (parsed.hasFullText && parsed.fullText) {
-          results[targetPmid] = {
+          const enrichedObj: PmcEnrichmentResult = {
             pmid: targetPmid,
-            pmcid: parsedPmcid || results[targetPmid].pmcid,
+            pmcid: resolvedPmcid,
             hasFullText: true,
             fullText: parsed.fullText,
             fullTextSections: parsed.fullTextSections
           };
+          results[targetPmid] = enrichedObj;
+          if (resolvedPmcid) {
+            apiCache.set(`pmc:efetch:${resolvedPmcid.toUpperCase()}:${maxCharsPerArticle}`, enrichedObj);
+            cachedInBatch.add(resolvedPmcid.toUpperCase());
+          }
+        } else if (resolvedPmcid) {
+          const emptyObj: PmcEnrichmentResult = {
+            pmid: targetPmid,
+            pmcid: resolvedPmcid,
+            hasFullText: false
+          };
+          apiCache.set(`pmc:efetch:${resolvedPmcid.toUpperCase()}:${maxCharsPerArticle}`, emptyObj);
+          cachedInBatch.add(resolvedPmcid.toUpperCase());
+        }
+      }
+
+      // Negatively cache any PMCID in batch whose XML had no extractable body
+      for (const reqPmcid of pmcBatch) {
+        if (!cachedInBatch.has(reqPmcid)) {
+          const pmid = pmcidToPmid[reqPmcid];
+          if (pmid) {
+            apiCache.set(`pmc:efetch:${reqPmcid}:${maxCharsPerArticle}`, {
+              pmid,
+              pmcid: reqPmcid,
+              hasFullText: false
+            });
+          }
         }
       }
     } catch (err) {

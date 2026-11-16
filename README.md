@@ -10,14 +10,16 @@
 
 **MedResearch AI** is an open-source medical literature research and clinical synthesis platform designed by **Dr. Puneet Maheshwari**. It features an interactive dual-pane workspace dividing the display into a 60% clinical synthesis canvas & note editor and a 40% document context inspector and PICO trial comparison matrix.
 
-The system connects concurrently across multiple authoritative biomedical repositories:
-1. **PubMed / NCBI Entrez:** Fully compliant with **NCBI Entrez Usage Guidelines (NBK25497 Chapter 2)**, implementing automated rate limiting (≤ 3 req/sec without API key, ≤ 10 req/sec with `NCBI_API_KEY`), mandatory `tool=MedResearchAI` and `email` tracking, `usehistory=y` batching, and XML parsing of structured `<AbstractText>` elements with section labels (Background, Methods, Results, Conclusions).
-2. **DOAJ (Directory of Open Access Journals):** Direct free REST API querying thousands of peer-reviewed open access medical and clinical journals.
-3. **Scopus / Crossref:** Direct metadata lookup across major clinical publishers (Elsevier Scopus DOIs, Springer Nature, Wiley).
-4. **Google Scholar & Google Search Grounding:** Direct scholarly search and live web citation grounding using Gemini 3.8 Flash Google Search tool integration, returning real web URIs and authentic clinical trial endpoints.
-5. **OpenAlex Scholarly Graph:** Semantic entity mapping across hundreds of millions of scholarly publications.
+The system connects concurrently across multiple authoritative biomedical repositories and trial registries:
+1. **PubMed / NCBI Entrez & PMC Open-Access Full Text:** Fully compliant with **NCBI Entrez Usage Guidelines (NBK25497 Chapter 2)**, implementing automated rate limiting (≤ 3 req/sec without API key, ≤ 10 req/sec with `NCBI_API_KEY`), mandatory `tool=MedResearchAI` and `email` tracking, `usehistory=y` batching, XML parsing of structured `<AbstractText>` elements, NCBI ID Converter (`pmid` -> `pmcid`), and PMC full-text `<article>` XML extraction prioritized across `Methods -> Results -> Tables -> Discussion`.
+2. **ClinicalTrials.gov REST API v2:** Direct trial search (`/api/v2/studies`) and automated `NCT\d{8}` enrichment populating trial designs, enrollment counts ($N$), arms/comparators, and primary outcomes.
+3. **ISRCTN Official XML API:** Detects `10.1186/isrctn\d+` DOIs and `ISRCTN\d+` trial IDs, querying `/api/query/format/default` XML metadata cleanly without HTML cookie-wall artifacts.
+4. **DOAJ (Directory of Open Access Journals):** Direct free REST API querying thousands of peer-reviewed open access medical and clinical journals.
+5. **Scopus / Crossref:** Direct metadata lookup across major clinical publishers (Elsevier Scopus DOIs, Springer Nature, Wiley).
+6. **Google Scholar & Google Search Grounding:** Direct scholarly search and live web citation grounding using Gemini 3.8 Flash Google Search tool integration, returning real web URIs and authentic clinical trial endpoints.
+7. **OpenAlex Scholarly Graph:** Semantic entity mapping across hundreds of millions of scholarly publications.
 
-The **Agentic RAG** workflow extracts isolated clinical populations, interventions, comparators, primary outcomes, and quantitative metrics (hazard ratios, risk ratios, and $p$-values) with verifiable bracket citations `[Author, Year (DOI)]`.
+The **Agentic RAG** workflow enforces cross-source deduplication (`PMID`, `DOI`, `NCT`, `ISRCTN`, and `>90%` normalized title similarity), keeps peer-reviewed publications as primary while absorbing registry PICO/sample metrics, caches external responses in a 24-hour TTL/LRU store, and extracts quantitative metrics (hazard ratios, risk ratios, and $p$-values) with verifiable bracket citations `[Author, Year (PMID/DOI)]`.
 
 ---
 
@@ -26,10 +28,10 @@ The **Agentic RAG** workflow extracts isolated clinical populations, interventio
 - **Split-Screen Dual-Pane Workspace:**
   - **Left Canvas (60%):** Text query box, landmark clinical query presets, real-time 5-step Agentic RAG progress tracker, interactive Markdown synthesis with clickable citation pills, and a full-featured clinical note editor with clipboard and download export.
   - **Right Context (40%):**
-    - **Tab 1: Extracted Sources Map:** Real-time study cards with journal impact, publication year, color-coded database source badges (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex), direct outbound DOI/PMID/Scholar links, and collapsible abstracts.
+    - **Tab 1: Extracted Sources Map:** Real-time study cards with journal impact, publication year, color-coded database source badges (PubMed, ClinicalTrials.gov, ISRCTN, DOAJ, Google Scholar, Scopus, OpenAlex), verification pills (`PMC Full Text`, `NCT Verified`, `ISRCTN Verified`, merged-source badges), **Find Similar (NCBI)** citation network discovery via `elink`, direct outbound DOI/PMID/PMCID/NCT/ISRCTN/Scholar links, and one-click **Export .RIS / .BibTeX** for Zotero and EndNote.
     - **Tab 2: PICO Data Matrix:** Cross-study comparison grid isolating clinical populations, sample sizes ($N$), active regimens, control groups, and $p$-value metrics with one-click CSV export.
     - **Tab 3: Vector Index Inspector:** 384-dimensional dense vector space telemetry, distance metric inspection, and semantic cosine proximity ranking bars.
-- **PICO Clinical Filter Bar:** Instant live filtering by study design tiering (RCTs, Meta-Analyses, Systematic Reviews, Cohort Studies), database source chips (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex), minimum sample size boundary ($N$ slider up to 5,000+), publication timelines (2, 5, 10 years, all time), and statistical significance ($p < 0.05$).
+- **PICO Clinical Filter Bar:** Instant live filtering by study design tiering (RCTs, Meta-Analyses, Systematic Reviews, Cohort Studies), database source chips (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex, ClinicalTrials.gov), minimum sample size boundary ($N$ slider up to 5,000+), publication timelines (2, 5, 10 years, all time), and statistical significance ($p < 0.05$).
 - **AI Editor & Writer:**
   - **Initial Structural Outlines & Full Paper Drafts:** Generates structured IMRaD manuscripts (Title, Abstract, Introduction, Methods, Results, Discussion, Conclusion, References) tailored to specific research questions, target databases (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex), and journal formats (*The Lancet*, *NEJM*, *JAMA*, *The BMJ*, *Nature Medicine*, *Annals of Internal Medicine*).
   - **Interactive Inline Section Tweaker:** Tweak, expand, rephrase in formal academic tone, condense, inject grounded citations, or bulletize individual sections inline with live word counting.
@@ -62,7 +64,13 @@ User Clinical Query
 [Agent 1: Query Agent] ──> Expands into MeSH Descriptors & UMLS Concepts
        │
        ▼
-[Search Service]       ──> Concurrent Querying of OpenAlex + PubMed/NCBI Entrez
+[Search Service]       ──> Concurrent Querying: PubMed + OpenAlex + Crossref + DOAJ + ClinicalTrials.gov v2
+       │
+       ▼
+[Enrichment & Cache]   ──> 24h TTL/LRU Cache + PMC Full-Text XML + NCT/ISRCTN XML Registry Resolvers
+       │
+       ▼
+[Cross-Source Merger]  ──> Deduplicates via PMID/DOI/NCT/ISRCTN/>90% Title; merges PICO & N
        │
        ▼
 [Embedding Service]    ──> OpenRouter / Hugging Face / Local 384-d Vector Profiles
@@ -74,7 +82,7 @@ User Clinical Query
 [PICO Extractor]       ──> Isolates Cohort Size (N), Intervention, Control & p-values
        │
        ▼
-[Agent 2: Synthesis]   ──> Clinical Report with Strict Bracket Citations [Author, Year (DOI)]
+[Agent 2: Synthesis]   ──> Clinical Report with Strict Bracket Citations [Author, Year (PMID/DOI)]
 ```
 
 ---
@@ -87,8 +95,8 @@ The entire application compiles and runs in a **single multi-stage container** s
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/puneet1984/medical-research-app.git
-cd medical-research-app
+git clone https://github.com/puneet1984/medical-research-AI.git
+cd medical-research-AI
 
 # 2. Configure environment variables (optional)
 cp .env.example .env
@@ -147,7 +155,8 @@ npm run build
 
 ## API Endpoints
 
-- `POST /api/search-and-index`: Executes query expansion, multi-database retrieval (PubMed, DOAJ, Crossref/Scopus, Google Scholar/Search, OpenAlex), vector embedding, PICO extraction, and clinical synthesis.
+- `POST /api/search-and-index`: Executes query expansion, multi-database retrieval (PubMed, PMC Full Text, ClinicalTrials.gov v2, ISRCTN XML, DOAJ, Crossref/Scopus, Google Scholar/Search, OpenAlex), cross-source deduplication & PICO merging, vector embedding, and PICO extraction.
+- `GET /api/articles/:pmid/related`: Queries NCBI Entrez `elink` (`pubmed_pubmed` and `pubmed_pubmed_citedin`) and hydrates related & citing PubMed article metadata (backed by the 24-hour TTL/LRU cache).
 - `POST /api/vector-search`: Performs fast cosine similarity search across indexed literature chunks.
 - `GET /api/vector-status`: Returns vector index telemetry (connection state, active provider, collection name, document count).
 - `GET /api/settings`: Retrieves active runtime environment configuration with masked keys.
@@ -162,4 +171,4 @@ npm run build
 ## Author & Acknowledgements
 
 Created and architected by **Dr. Puneet Maheshwari**.  
-Powered by NCBI PubMed Entrez E-Utilities (NBK25497), DOAJ (Directory of Open Access Journals), Crossref, Google Scholar Grounding, and OpenAlex.
+Powered by NCBI PubMed Entrez E-Utilities & PMC Full-Text XML (NBK25497), ClinicalTrials.gov REST API v2, ISRCTN XML API, DOAJ (Directory of Open Access Journals), Crossref, Google Scholar Grounding, and OpenAlex.

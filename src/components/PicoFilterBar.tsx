@@ -23,7 +23,8 @@ const DATABASE_SOURCES = [
   'DOAJ',
   'Google Scholar',
   'Scopus',
-  'OpenAlex'
+  'OpenAlex',
+  'ClinicalTrials.gov'
 ];
 
 const TIMELINE_PRESETS = [

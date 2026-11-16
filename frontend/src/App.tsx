@@ -201,9 +201,11 @@ export default function App() {
   // Filtered documents calculation
   const filteredDocuments = useMemo(() => {
     return documents.filter(doc => {
-      // 0. Database source filter (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex)
+      // 0. Database source filter (PubMed, DOAJ, Google Scholar, Scopus, OpenAlex, ClinicalTrials.gov)
       if (filters.sourceDatabases && filters.sourceDatabases.length > 0) {
-        if (!filters.sourceDatabases.includes(doc.source)) {
+        const matchesPrimary = filters.sourceDatabases.includes(doc.source);
+        const matchesMerged = Array.isArray(doc.mergedSources) && doc.mergedSources.some(s => filters.sourceDatabases.includes(s));
+        if (!matchesPrimary && !matchesMerged) {
           return false;
         }
       }

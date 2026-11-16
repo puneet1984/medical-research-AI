@@ -7,7 +7,7 @@ export interface PicoData {
   pValues: string[];
   hazardRatio?: string;
   riskRatio?: string;
-  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series';
+  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series' | 'Preclinical / Experimental Study' | 'Consensus / Classification Paper' | 'Observational / Descriptive Study';
 }
 
 export interface FullTextSections {
@@ -16,6 +16,19 @@ export interface FullTextSections {
   tables?: string;
   discussion?: string;
 }
+
+export type LiteratureDatabaseSource =
+  | 'OpenAlex'
+  | 'PubMed'
+  | 'DOAJ'
+  | 'Google Scholar'
+  | 'Embase'
+  | 'Scopus'
+  | 'Crossref'
+  | 'Google Search'
+  | 'ClinicalTrials'
+  | 'ClinicalTrials.gov'
+  | 'ISRCTN';
 
 export interface MedicalDocument {
   id: string;
@@ -27,12 +40,20 @@ export interface MedicalDocument {
   doi: string;
   pmid?: string;
   pmcid?: string;
+  nctId?: string;
+  isrctnId?: string;
+  linkedPmids?: string[];
+  linkedDois?: string[];
+  mergedSources?: string[];
+  nctVerified?: boolean;
+  isrctnVerified?: boolean;
+  registryUrl?: string;
   hasFullText?: boolean;
   fullText?: string;
   fullTextSections?: FullTextSections;
   abstract: string;
   citationCount: number;
-  source: 'OpenAlex' | 'PubMed' | 'DOAJ' | 'Google Scholar' | 'Embase' | 'Scopus' | 'Google Search' | 'ClinicalTrials';
+  source: LiteratureDatabaseSource;
   webUrl?: string;
   isOpenAccess?: boolean;
   pico: PicoData;
@@ -105,7 +126,7 @@ export interface StudyStub {
   journal: string;
   doi: string;
   pmid?: string;
-  source: 'OpenAlex' | 'PubMed' | 'DOAJ' | 'Google Scholar' | 'Embase' | 'Scopus' | 'Google Search' | 'ClinicalTrials';
+  source: LiteratureDatabaseSource;
   webUrl?: string;
   isOpenAccess?: boolean;
   citationCount?: number;

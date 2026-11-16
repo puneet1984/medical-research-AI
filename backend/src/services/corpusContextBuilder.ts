@@ -30,11 +30,14 @@ export const STUDY_DESIGN_PLURAL_MAP: Record<string, string> = {
   'Case Report': 'Case Reports',
   'Systematic Review': 'Systematic Reviews',
   'Randomized Controlled Trial': 'Randomized Controlled Trials',
-  'Clinical Trial': 'Clinical Trials'
+  'Clinical Trial': 'Clinical Trials',
+  'Preclinical / Experimental Study': 'Preclinical / Experimental Studies',
+  'Consensus / Classification Paper': 'Consensus / Classification Papers',
+  'Observational / Descriptive Study': 'Observational / Descriptive Studies'
 };
 
 export function pluralizeStudyDesign(design: string, count: number): string {
-  const cleanDesign = (design || 'Clinical Trial').trim();
+  const cleanDesign = (design || 'Observational / Descriptive Study').trim();
   if (count === 1) return cleanDesign;
   if (STUDY_DESIGN_PLURAL_MAP[cleanDesign]) {
     return STUDY_DESIGN_PLURAL_MAP[cleanDesign];
@@ -50,7 +53,7 @@ export function pluralizeStudyDesign(design: string, count: number): string {
  * Decodes common named and numeric HTML/XML entities (e.g. &gt;, &lt;, &amp;, &quot;, &#39;, &nbsp;)
  * and collapses excessive whitespace.
  */
-export function decodeHtmlEntities(input?: string | null): string {
+export function decodeHtmlEntities(input?: string | null, preserveNewlines = false): string {
   if (!input || typeof input !== 'string') return '';
   let text = input
     .replace(/&amp;/gi, '&')
@@ -79,6 +82,15 @@ export function decodeHtmlEntities(input?: string | null): string {
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&amp;/gi, '&');
+
+  if (preserveNewlines) {
+    return text
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t\f\v]+/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .trim();
+  }
 
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -133,6 +145,46 @@ export function sanitizeUrlField(url?: string | null): string | undefined {
   return cleaned;
 }
 
+const PLACEHOLDER_AUTHOR_RE = /^(?:investigator|lead\s+investigator|lead\s+researcher|lead\s+author|researcher|author|authors|unknown|anonymous|anon|none|n\/a|na|unavailable|editorial\s+team|staff)(?:\s+et\s+al\.?)?$/i;
+
+export function isPlaceholderAuthor(name?: string | null): boolean {
+  if (!name || typeof name !== 'string') return true;
+  const trimmed = decodeHtmlEntities(name).replace(/[.,;]+$/g, '').trim();
+  if (!trimmed || trimmed.length < 2) return true;
+  return PLACEHOLDER_AUTHOR_RE.test(trimmed);
+}
+
+export function sanitizeAuthorsList(authors?: string[] | null): string[] {
+  if (!Array.isArray(authors)) return [];
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const raw of authors) {
+    const val = decodeHtmlEntities(raw || '').replace(/\s+/g, ' ').trim();
+    if (isPlaceholderAuthor(val)) continue;
+    const key = val.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      cleaned.push(val);
+    }
+  }
+  return cleaned;
+}
+
+/**
+ * Resolves a clean display author or falls back to the journal/organization name (or '' if generic).
+ */
+export function resolveAuthorOrJournalFallback(doc: Pick<MedicalDocument, 'firstAuthor' | 'authors' | 'journal'>): string {
+  const validAuthors = sanitizeAuthorsList(doc.authors);
+  if (validAuthors.length > 0) return validAuthors[0];
+  const rawFirst = decodeHtmlEntities(doc.firstAuthor || '').trim();
+  if (!isPlaceholderAuthor(rawFirst)) return rawFirst;
+  const cleanJournal = sanitizeJournalField(doc.journal);
+  if (cleanJournal && cleanJournal !== 'Biomedical Journal' && cleanJournal !== 'Medical Journal') {
+    return cleanJournal;
+  }
+  return '';
+}
+
 /**
  * Sanitizes all textual and URL metadata fields on a MedicalDocument.
  */
@@ -140,8 +192,12 @@ export function sanitizeDocumentMetadata(doc: MedicalDocument): MedicalDocument 
   const cleanDoi = sanitizeDoi(doc.doi);
   const cleanTitle = decodeHtmlEntities(doc.title).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || 'Clinical Study';
   const cleanJournal = sanitizeJournalField(doc.journal);
-  const cleanAuthors = (doc.authors || []).map(a => decodeHtmlEntities(a).trim()).filter(Boolean);
-  const cleanFirstAuthor = decodeHtmlEntities(doc.firstAuthor || cleanAuthors[0] || 'Investigator').trim();
+  const cleanAuthors = sanitizeAuthorsList(doc.authors);
+  const cleanFirstAuthor = resolveAuthorOrJournalFallback({
+    firstAuthor: doc.firstAuthor,
+    authors: cleanAuthors,
+    journal: cleanJournal
+  });
   const cleanAbstract = decodeHtmlEntities(doc.abstract || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
   return {
@@ -166,6 +222,201 @@ export function sanitizeDocumentMetadata(doc: MedicalDocument): MedicalDocument 
         }
       : doc.pico
   };
+}
+
+/**
+ * Computes PICO data richness score for Section 3.3 / PICO_MATRIX ranking:
+ * +3 if N is reported, +3 if HR/RR/OR/p-value is reported,
+ * +2 if intervention & comparator are reported, +2 if hasFullText is true.
+ */
+export function computePicoCompletenessScore(doc: MedicalDocument): number {
+  let score = 0;
+  const pico = doc.pico;
+  if (!pico) return doc.hasFullText ? 2 : 0;
+
+  if (typeof pico.sampleSize === 'number' && pico.sampleSize > 0) {
+    score += 3;
+  }
+  const hasStats =
+    Boolean(pico.hazardRatio && pico.hazardRatio !== 'Not reported') ||
+    Boolean(pico.riskRatio && pico.riskRatio !== 'Not reported') ||
+    (Array.isArray(pico.pValues) && pico.pValues.length > 0);
+  if (hasStats) {
+    score += 3;
+  }
+  const hasIntervention = Boolean(pico.intervention && pico.intervention !== 'Not reported');
+  const hasComparator = Boolean(pico.comparator && pico.comparator !== 'Not reported');
+  if (hasIntervention && hasComparator) {
+    score += 2;
+  }
+  if (doc.hasFullText) {
+    score += 2;
+  }
+  return score;
+}
+
+/**
+ * Ranks studies by `picoCompletenessScore * queryRelevance` and avoids empty rows
+ * when metric-bearing studies exist in the corpus.
+ */
+export function selectStudiesByDataRichness(
+  studies: MedicalDocument[],
+  maxCount = 15
+): MedicalDocument[] {
+  if (!studies || studies.length === 0) return [];
+  const sanitized = studies.map(sanitizeDocumentMetadata);
+  const withScores = sanitized.map((doc) => {
+    const richness = computePicoCompletenessScore(doc);
+    const hasAnyMeaningfulPico =
+      richness > 0 ||
+      Boolean(doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported') ||
+      Boolean(doc.pico?.population && doc.pico.population !== 'Not reported');
+    const relevance = typeof doc.score === 'number' && doc.score > 0 ? doc.score : 0.5;
+    const weighted = (richness > 0 ? richness : (hasAnyMeaningfulPico ? 0.5 : 0)) * relevance;
+    return { doc, richness, hasAnyMeaningfulPico, weighted };
+  });
+
+  const nonEmpty = withScores.filter(x => x.hasAnyMeaningfulPico);
+  const pool = nonEmpty.length > 0 ? nonEmpty : withScores;
+
+  pool.sort((a, b) => {
+    if (Math.abs(b.weighted - a.weighted) > 0.01) return b.weighted - a.weighted;
+    if (b.richness !== a.richness) return b.richness - a.richness;
+    return (b.doc.score || 0) - (a.doc.score || 0);
+  });
+
+  return pool.slice(0, maxCount).map(x => x.doc);
+}
+
+function normalizeTitleForDedup(title?: string | null): string {
+  return decodeHtmlEntities(title || '')
+    .toLowerCase()
+    .replace(/\[[^\]]*(?:abstract|poster|letter|comment|erratum)[^\]]*\]/gi, ' ')
+    .replace(/\([^)]*(?:abstract|poster|suppl)[^)]*\)/gi, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getBigrams(str: string): Set<string> {
+  const clean = str.replace(/\s+/g, ' ');
+  const set = new Set<string>();
+  for (let i = 0; i < clean.length - 1; i++) {
+    set.add(clean.slice(i, i + 2));
+  }
+  return set;
+}
+
+export function computeTitleSimilarity(titleA: string, titleB: string): number {
+  const normA = normalizeTitleForDedup(titleA);
+  const normB = normalizeTitleForDedup(titleB);
+  if (!normA || !normB) return 0;
+  if (normA === normB) return 1;
+
+  // Token Jaccard similarity
+  const tokensA = new Set(normA.split(' ').filter(Boolean));
+  const tokensB = new Set(normB.split(' ').filter(Boolean));
+  let tokenIntersect = 0;
+  for (const t of tokensA) {
+    if (tokensB.has(t)) tokenIntersect++;
+  }
+  const tokenUnion = tokensA.size + tokensB.size - tokenIntersect;
+  const jaccard = tokenUnion > 0 ? tokenIntersect / tokenUnion : 0;
+
+  // Character bigram Dice similarity
+  const biA = getBigrams(normA);
+  const biB = getBigrams(normB);
+  let biIntersect = 0;
+  for (const b of biA) {
+    if (biB.has(b)) biIntersect++;
+  }
+  const dice = biA.size + biB.size > 0 ? (2 * biIntersect) / (biA.size + biB.size) : 0;
+
+  return Math.max(jaccard, dice);
+}
+
+function getNormalizedSurname(doc: MedicalDocument): string {
+  const candidate = sanitizeAuthorsList(doc.authors)[0] || doc.firstAuthor || '';
+  if (isPlaceholderAuthor(candidate)) return '';
+  return candidate.toLowerCase().split(/[\s,]+/)[0]?.replace(/[^a-z]/g, '') || '';
+}
+
+function chooseRicherDocument(a: MedicalDocument, b: MedicalDocument): MedicalDocument {
+  const scoreDoc = (d: MedicalDocument) =>
+    (d.hasFullText ? 50 : 0) +
+    (d.source === 'PubMed' ? 20 : 0) +
+    (d.pmid ? 10 : 0) +
+    (d.doi ? 8 : 0) +
+    computePicoCompletenessScore(d) * 3 +
+    Math.min(20, Math.floor((d.abstract || '').length / 100)) +
+    (sanitizeAuthorsList(d.authors).length > 0 ? 5 : 0);
+
+  const primary = scoreDoc(b) > scoreDoc(a) ? b : a;
+  const secondary = primary === a ? b : a;
+
+  return {
+    ...primary,
+    pmid: primary.pmid || secondary.pmid,
+    pmcid: primary.pmcid || secondary.pmcid,
+    doi: primary.doi || secondary.doi,
+    hasFullText: primary.hasFullText || secondary.hasFullText,
+    fullText: primary.fullText || secondary.fullText,
+    fullTextSections: primary.fullTextSections || secondary.fullTextSections,
+    abstract: (primary.abstract || '').length >= (secondary.abstract || '').length ? primary.abstract : secondary.abstract,
+    authors: sanitizeAuthorsList(primary.authors).length > 0 ? primary.authors : secondary.authors
+  };
+}
+
+/**
+ * Deduplicates studies with identical DOI/PMID or >90% normalized title similarity
+ * (e.g., conference abstract + published journal article by same first author and year),
+ * retaining the richest metadata record before counting or citing.
+ */
+export function deduplicateNearIdenticalStudies(studies: MedicalDocument[]): MedicalDocument[] {
+  if (!studies || studies.length === 0) return [];
+  const result: MedicalDocument[] = [];
+  const normTitles: string[] = [];
+
+  for (const rawDoc of studies) {
+    const doc = sanitizeDocumentMetadata(rawDoc);
+    const normTitle = normalizeTitleForDedup(doc.title);
+    const docDoi = sanitizeDoi(doc.doi).toLowerCase();
+    const docPmid = (doc.pmid || '').trim();
+    const docSurname = getNormalizedSurname(doc);
+
+    let duplicateIdx = -1;
+    for (let i = 0; i < result.length; i++) {
+      const existing = result[i];
+      if (docPmid && existing.pmid && docPmid === existing.pmid.trim()) {
+        duplicateIdx = i;
+        break;
+      }
+      if (docDoi && existing.doi && docDoi === sanitizeDoi(existing.doi).toLowerCase()) {
+        duplicateIdx = i;
+        break;
+      }
+      const sim = computeTitleSimilarity(normTitle, normTitles[i]);
+      if (sim > 0.90) {
+        const existingSurname = getNormalizedSurname(existing);
+        const sameYearBand = Math.abs((doc.year || 0) - (existing.year || 0)) <= 1;
+        const sameAuthorOrMissing = !docSurname || !existingSurname || docSurname === existingSurname;
+        if ((sameYearBand && sameAuthorOrMissing) || sim >= 0.95) {
+          duplicateIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (duplicateIdx >= 0) {
+      result[duplicateIdx] = chooseRicherDocument(result[duplicateIdx], doc);
+      normTitles[duplicateIdx] = normalizeTitleForDedup(result[duplicateIdx].title);
+    } else {
+      result.push(doc);
+      normTitles.push(normTitle);
+    }
+  }
+
+  return result;
 }
 
 const QUERY_STOP_WORDS = new Set([
@@ -272,7 +523,7 @@ export function rankAndFilterStudiesForQuestion(
     };
   }
 
-  const sanitizedStudies = studies.map(sanitizeDocumentMetadata);
+  const sanitizedStudies = deduplicateNearIdenticalStudies(studies);
   const { specificEntities, coreEntities, allTerms, specificPhrases } = extractQueryRelevanceProfile(researchQuestion);
   const queryVector = generateLocalEmbedding(researchQuestion, 384);
 
@@ -411,7 +662,9 @@ const DATABASE_LABEL_MAP: Record<string, string> = {
   scopus: 'Scopus',
   embase: 'Embase',
   'google search': 'Google Search',
-  clinicaltrials: 'ClinicalTrials.gov'
+  clinicaltrials: 'ClinicalTrials.gov',
+  'clinicaltrials.gov': 'ClinicalTrials.gov',
+  isrctn: 'ISRCTN'
 };
 
 /**
@@ -442,7 +695,7 @@ export function buildRetrievalStats(
       pmcFullTextCount++;
     }
 
-    const design = doc.pico?.design || 'Clinical Trial';
+    const design = doc.pico?.design || 'Observational / Descriptive Study';
     studyDesignCounts[design] = (studyDesignCounts[design] || 0) + 1;
   }
 
@@ -489,62 +742,93 @@ export function buildRetrievalStats(
 
 /**
  * Formats canonical inline citation tag: [Author, Year (PMID/DOI)]
+ * Uses sanitized author or falls back cleanly to journal/organization name or Year+ID (never "Investigator").
  */
 export function formatCanonicalCitation(doc: MedicalDocument): string {
-  const authorSurname = decodeHtmlEntities(doc.firstAuthor || 'Investigator').split(/\s+/)[0] || 'Investigator';
   const cleanDoi = sanitizeDoi(doc.doi);
   const idPart = doc.pmid ? `PMID:${doc.pmid}` : (cleanDoi || doc.id);
-  return `[${authorSurname}, ${doc.year} (${idPart})]`;
+  const validAuthors = sanitizeAuthorsList(doc.authors);
+  const candidateFirst = validAuthors[0] || (!isPlaceholderAuthor(doc.firstAuthor) ? decodeHtmlEntities(doc.firstAuthor) : '');
+
+  if (candidateFirst) {
+    const authorSurname = candidateFirst.split(/\s+/)[0] || candidateFirst;
+    return `[${authorSurname}, ${doc.year} (${idPart})]`;
+  }
+
+  const cleanJournal = sanitizeJournalField(doc.journal);
+  if (cleanJournal && cleanJournal !== 'Biomedical Journal' && cleanJournal !== 'Medical Journal') {
+    return `[${cleanJournal}, ${doc.year} (${idPart})]`;
+  }
+  return `[${doc.year} (${idPart})]`;
 }
 
 /**
  * Builds structured `PICO_MATRIX`, `CONTEXT_SOURCES`, and reconciled `RETRIEVAL_METADATA`
- * from relevance-ranked, HTML-decoded studies.
+ * from relevance-ranked, data-richness-prioritized, HTML-decoded studies.
  */
 export function buildCorpusContext(
   relevantStudies: MedicalDocument[],
   stats: RetrievalStatsMetadata,
   maxDocsInContext = 15
 ): { picoMatrixJson: string; contextSourcesText: string; statsMetadataText: string } {
-  const includedDocs = relevantStudies.slice(0, maxDocsInContext).map(sanitizeDocumentMetadata);
+  const includedDocs = selectStudiesByDataRichness(relevantStudies, maxDocsInContext);
 
-  const picoMatrix = includedDocs.map((doc, idx) => ({
-    sourceIndex: idx + 1,
-    canonicalCitation: formatCanonicalCitation(doc),
-    firstAuthor: doc.firstAuthor,
-    authors: doc.authors.slice(0, 6),
-    title: doc.title,
-    journal: doc.journal,
-    year: doc.year,
-    pmid: doc.pmid || null,
-    pmcid: doc.pmcid || null,
-    doi: doc.doi,
-    sourceDatabase: doc.source,
-    relevanceScore: doc.score ?? null,
-    hasPmcFullText: Boolean(doc.hasFullText),
-    design: doc.pico?.design || 'Clinical Trial',
-    population: doc.pico?.population && doc.pico.population !== 'Not reported' ? doc.pico.population : 'Not reported',
-    sampleSizeN: typeof doc.pico?.sampleSize === 'number' && doc.pico.sampleSize > 0
-      ? doc.pico.sampleSize
-      : 'Not reported',
-    intervention: doc.pico?.intervention && doc.pico.intervention !== 'Not reported' ? doc.pico.intervention : 'Not reported',
-    comparator: doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : 'Not reported',
-    primaryOutcome: doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : 'Not reported',
-    hazardRatio: doc.pico?.hazardRatio || 'Not reported',
-    riskRatio: doc.pico?.riskRatio || 'Not reported',
-    pValues: Array.isArray(doc.pico?.pValues) && doc.pico.pValues.length > 0
-      ? doc.pico.pValues
-      : ['Not reported']
-  }));
+  const picoMatrix = includedDocs.map((doc, idx) => {
+    const validAuthors = sanitizeAuthorsList(doc.authors);
+    const authorLabel = resolveAuthorOrJournalFallback(doc);
+    return {
+      sourceIndex: idx + 1,
+      canonicalCitation: formatCanonicalCitation(doc),
+      firstAuthor: authorLabel || null,
+      authors: validAuthors.slice(0, 6),
+      title: doc.title,
+      journal: doc.journal,
+      year: doc.year,
+      pmid: doc.pmid || null,
+      pmcid: doc.pmcid || null,
+      nctId: doc.nctId || null,
+      isrctnId: doc.isrctnId || null,
+      doi: doc.doi || null,
+      sourceDatabase: doc.source,
+      mergedSources: doc.mergedSources && doc.mergedSources.length > 0 ? doc.mergedSources : [doc.source],
+      relevanceScore: doc.score ?? null,
+      picoCompletenessScore: computePicoCompletenessScore(doc),
+      hasPmcFullText: Boolean(doc.hasFullText),
+      design: doc.pico?.design || 'Observational / Descriptive Study',
+      population: doc.pico?.population && doc.pico.population !== 'Not reported' ? doc.pico.population : 'Not reported',
+      sampleSizeN: typeof doc.pico?.sampleSize === 'number' && doc.pico.sampleSize > 0
+        ? doc.pico.sampleSize
+        : 'Not reported',
+      intervention: doc.pico?.intervention && doc.pico.intervention !== 'Not reported' ? doc.pico.intervention : 'Not reported',
+      comparator: doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : 'Not reported',
+      primaryOutcome: doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : 'Not reported',
+      hazardRatio: doc.pico?.hazardRatio || 'Not reported',
+      riskRatio: doc.pico?.riskRatio || 'Not reported',
+      pValues: Array.isArray(doc.pico?.pValues) && doc.pico.pValues.length > 0
+        ? doc.pico.pValues
+        : ['Not reported']
+    };
+  });
 
   const contextSourcesText = includedDocs.map((doc, idx) => {
     const citationKey = formatCanonicalCitation(doc);
+    const validAuthors = sanitizeAuthorsList(doc.authors);
+    const authorDisplay = validAuthors.length > 0
+      ? validAuthors.slice(0, 8).join(', ')
+      : (resolveAuthorOrJournalFallback(doc) || 'Not reported');
+    const registryIds = [
+      doc.nctId ? `NCT: ${doc.nctId}` : null,
+      doc.isrctnId ? `ISRCTN: ${doc.isrctnId}` : null
+    ].filter(Boolean).join(' | ');
+    const mergedLabel = doc.mergedSources && doc.mergedSources.length > 1
+      ? ` (Merged from: ${doc.mergedSources.join(', ')})`
+      : '';
     const lines: string[] = [
       `[SOURCE ${idx + 1}] ${citationKey}`,
-      `Authors: ${doc.authors.slice(0, 8).join(', ') || doc.firstAuthor}`,
+      `Authors: ${authorDisplay}`,
       `Title: ${doc.title}`,
-      `Journal: ${doc.journal} (${doc.year}) | Source DB: ${doc.source} | PMID: ${doc.pmid || 'N/A'} | PMCID: ${doc.pmcid || 'N/A'} | DOI: ${doc.doi || 'N/A'}`,
-      `Study Design: ${doc.pico?.design || 'Clinical Trial'} | Sample Size N: ${doc.pico?.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'}`,
+      `Journal: ${doc.journal} (${doc.year}) | Source DB: ${doc.source}${mergedLabel} | PMID: ${doc.pmid || 'N/A'} | PMCID: ${doc.pmcid || 'N/A'} | DOI: ${doc.doi || 'N/A'}${registryIds ? ` | ${registryIds}` : ''}`,
+      `Study Design: ${doc.pico?.design || 'Observational / Descriptive Study'} | Sample Size N: ${doc.pico?.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'}`,
       `AbstractText: ${doc.abstract || 'Not reported in the retrieved studies'}`
     ];
 

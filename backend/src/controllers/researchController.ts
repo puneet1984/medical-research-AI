@@ -8,6 +8,8 @@ import {
 } from '../services/searchService.js';
 import { upsertDocuments, searchSimilar, findCachedSimilar, getVectorStatus, initQdrant } from '../services/vectorService.js';
 import { synthesizeLiterature } from '../agents/synthesisAgent.js';
+import { deduplicateAndMergeStudies } from '../utils/deduplicateStudies.js';
+import { fetchRelatedAndCitingArticles } from '../services/pubmedLinkService.js';
 
 interface SessionQueryStudies {
   query: string;
@@ -40,15 +42,8 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     // 2. Agentic Step 2: Multi-Database Bulk Retrieval across PubMed, OpenAlex, Crossref, DOAJ
     const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(trimmedQuery, 500, 0);
 
-    // Combine cached vector studies with live fetched documents, deduplicating by DOI/PMID/Title
-    const seenMap = new Map<string, MedicalDocument>();
-    for (const doc of [...cachedVectorHits, ...rawDocuments]) {
-      const key = (doc.doi || doc.pmid || doc.title).toLowerCase().trim();
-      if (!seenMap.has(key)) {
-        seenMap.set(key, doc);
-      }
-    }
-    const combinedPool = Array.from(seenMap.values());
+    // Combine cached vector studies with live fetched documents, deduplicating & merging across PubMed, registries, and scholarly DBs
+    const combinedPool = deduplicateAndMergeStudies([...cachedVectorHits, ...rawDocuments]);
 
     // Order all available studies strictly recent to past (Year descending)
     combinedPool.sort((a, b) => {
@@ -181,17 +176,9 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
         const { allStudies: nextLiveStudies } = await searchAllAvailableStudies(query.trim(), fetchAmount, currentOffset);
 
         if (nextLiveStudies && nextLiveStudies.length > 0) {
-          const existingKeySet = new Set(pool.map(d => (d.doi || d.pmid || d.title).toLowerCase().trim()));
-          const novelStudies: MedicalDocument[] = [];
-          for (const study of nextLiveStudies) {
-            const key = (study.doi || study.pmid || study.title).toLowerCase().trim();
-            if (!existingKeySet.has(key)) {
-              existingKeySet.add(key);
-              novelStudies.push(study);
-            }
-          }
-          if (novelStudies.length > 0) {
-            pool.push(...novelStudies);
+          const prevCount = pool.length;
+          pool = deduplicateAndMergeStudies([...pool, ...nextLiveStudies]);
+          if (pool.length > prevCount) {
             // Re-sort recent to past
             pool.sort((a, b) => {
               if (b.year !== a.year) return b.year - a.year;
@@ -199,7 +186,7 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
             });
             session.allStudies = pool;
             sessionStudyRegistry.set(trimmedQuery, session);
-            console.log(`[researchController] Added ${novelStudies.length} new studies to session pool. Total pool: ${pool.length}`);
+            console.log(`[researchController] Added ${pool.length - prevCount} new unique studies to session pool. Total pool: ${pool.length}`);
           }
         }
       } catch (liveFetchErr) {
@@ -607,6 +594,30 @@ export async function handleSynthesizeReport(req: Request, res: Response): Promi
   }
 }
 
+export async function handleGetRelatedArticles(req: Request, res: Response): Promise<void> {
+  try {
+    const pmid = String(req.params.pmid || '').trim();
+    if (!/^\d+$/.test(pmid)) {
+      res.status(400).json({ error: 'Valid numeric PMID parameter is required' });
+      return;
+    }
+
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 8));
+    const result = await fetchRelatedAndCitingArticles(pmid, limit);
+
+    res.json({
+      success: true,
+      ...result
+    });
+  } catch (err) {
+    console.error('[researchController] Related articles lookup error:', err);
+    res.status(500).json({
+      error: 'Failed to fetch related and citing PubMed articles',
+      details: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+
 export const researchController = {
   handleSearchAndIndex,
   handleSynthesizeReport,
@@ -619,5 +630,6 @@ export const researchController = {
   handleGetOpenRouterModels,
   handleTestConnection,
   handleGeneratePaperDraft,
-  handleSectionAction
+  handleSectionAction,
+  handleGetRelatedArticles
 };

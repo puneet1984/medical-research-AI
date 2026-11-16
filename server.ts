@@ -18,7 +18,8 @@ import {
   handleGetOpenRouterModels,
   handleTestConnection,
   handleGeneratePaperDraft,
-  handleSectionAction
+  handleSectionAction,
+  handleGetRelatedArticles
 } from './backend/src/controllers/researchController.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -54,6 +55,7 @@ app.post('/api/synthesize-report', handleSynthesizeReport);
 app.post('/api/search-and-index/load-more', handleLoadMoreStudies);
 app.post('/api/vector-search', handleVectorSearch);
 app.post('/api/nlp/metamap', handleMetaMapExtract);
+app.get('/api/articles/:pmid/related', handleGetRelatedArticles);
 
 // Settings & Runtime Configuration
 app.get('/api/settings', handleGetSettings);
