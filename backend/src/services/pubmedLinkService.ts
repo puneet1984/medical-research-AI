@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { apiCache } from '../utils/apiCache.js';
-import { decodeHtmlEntities, sanitizeDoi, sanitizeJournalField } from './corpusContextBuilder.js';
+import { decodeHtmlEntities, sanitizeDoi, sanitizeJournalField, parseValidPublicationYear } from './corpusContextBuilder.js';
 
 const NCBI_ELINK_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi';
 const NCBI_ESUMMARY_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi';
@@ -11,7 +11,7 @@ export interface LinkedPubMedArticle {
   title: string;
   firstAuthor: string;
   journal: string;
-  year: number;
+  year: number | null;
   doi: string;
   webUrl: string;
 }
@@ -160,8 +160,7 @@ async function hydratePmidSummaries(pmids: string[]): Promise<Record<string, Lin
         const title = decodeHtmlEntities(String(item.title || `PubMed Article ${uid}`).replace(/\.$/, ''));
         const firstAuthor = decodeHtmlEntities(String(item.authors?.[0]?.name || ''));
         const journal = sanitizeJournalField(item.fulljournalname || item.source || 'PubMed Indexed Journal');
-        const yearMatch = String(item.pubdate || '').match(/\b(19|20)\d{2}\b/);
-        const year = yearMatch ? parseInt(yearMatch[0], 10) : new Date().getFullYear();
+        const year = parseValidPublicationYear(item.pubdate);
 
         let doi = '';
         if (Array.isArray(item.articleids)) {
@@ -209,7 +208,7 @@ export async function fetchRelatedAndCitingArticles(pmid: string, limit = 10): P
       title: `PubMed Record PMID:${id}`,
       firstAuthor: '',
       journal: 'PubMed',
-      year: new Date().getFullYear(),
+      year: null,
       doi: '',
       webUrl: `https://pubmed.ncbi.nlm.nih.gov/${id}/`
     };

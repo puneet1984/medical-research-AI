@@ -5,7 +5,8 @@ import { humanizeMedicalProse } from '../services/paperDraftService.js';
 import {
   pluralizeStudyDesign,
   sanitizeDocumentMetadata,
-  rankAndFilterStudiesForQuestion
+  rankAndFilterStudiesForQuestion,
+  formatPublicationYear
 } from '../services/corpusContextBuilder.js';
 
 export interface SynthesisResult {
@@ -20,7 +21,7 @@ export interface SynthesisResult {
  */
 function buildDeterministicSynthesis(query: string, docs: MedicalDocument[]): string {
   const topDocs = docs.slice(0, 6).map(sanitizeDocumentMetadata);
-  const citations = topDocs.map(d => `[${d.firstAuthor}, ${d.year} (${d.pmid ? `PMID:${d.pmid}` : (d.doi || d.id)})]`);
+  const citations = topDocs.map(d => `[${d.firstAuthor}, ${formatPublicationYear(d.year)} (${d.pmid ? `PMID:${d.pmid}` : (d.doi || d.id)})]`);
 
   const validSampleSizes = topDocs
     .map(d => d.pico.sampleSize)
@@ -58,7 +59,7 @@ Based on multi-database retrieval of ${docs.length} peer-reviewed clinical studi
 
 #### 🎯 4. Outcomes & Effect Sizes (O)
 - **Statistical Significance:**
-${topDocs.map((d, i) => `  - **${d.firstAuthor} et al. (${d.year}):** ${d.pico.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'Primary outcome not reported'} — ${d.pico.hazardRatio ? `Hazard Ratio: \`${d.pico.hazardRatio}\`, ` : ''}\`${d.pico.pValues.length > 0 ? d.pico.pValues.join(', ') : 'p-value: Not reported'}\` ${citations[i] || ''}.`).join('\n')}
+${topDocs.map((d, i) => `  - **${d.firstAuthor} et al. (${formatPublicationYear(d.year)}):** ${d.pico.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'Primary outcome not reported'} — ${d.pico.primaryStatistic ? `Primary Stat: \`${d.pico.primaryStatistic}\`, ` : ''}${d.pico.hazardRatio ? `Hazard Ratio: \`${d.pico.hazardRatio}\`, ` : ''}${d.pico.riskRatio ? `Risk Ratio: \`${d.pico.riskRatio}\`, ` : ''}\`${d.pico.pValues.length > 0 ? d.pico.pValues.join(', ') : 'p-value: Not reported'}\` ${citations[i] || ''}.`).join('\n')}
 
 ---
 
@@ -69,7 +70,7 @@ ${topDocs.map((d, i) => `  - **${d.firstAuthor} et al. (${d.year}):** ${d.pico.p
 ---
 
 ### Cited Clinical Trials & Literature
-${topDocs.map((d, i) => `${i + 1}. **${d.firstAuthor} et al. (${d.year})** — *${d.title}*. **${d.journal}**. ${d.doi ? `DOI: [${d.doi}](https://doi.org/${d.doi}) | ` : ''}PMID: \`${d.pmid || 'N/A'}\``).join('\n')}
+${topDocs.map((d, i) => `${i + 1}. **${d.firstAuthor} et al. (${formatPublicationYear(d.year)})** — *${d.title}*. **${d.journal}**. ${d.doi ? `DOI: [${d.doi}](https://doi.org/${d.doi}) | ` : ''}PMID: \`${d.pmid || 'N/A'}\``).join('\n')}
 `;
 }
 
@@ -94,21 +95,22 @@ export async function synthesizeLiterature(
 
   // Format context for prompt with explicit citation keys
   const contextFormatted = activeDocs.slice(0, 8).map((doc, idx) => {
-    const citationKey = `[${doc.firstAuthor}, ${doc.year} (${doc.pmid ? `PMID:${doc.pmid}` : (doc.doi || doc.id)})]`;
+    const yearLabel = formatPublicationYear(doc.year);
+    const citationKey = `[${doc.firstAuthor}, ${yearLabel} (${doc.pmid ? `PMID:${doc.pmid}` : (doc.doi || doc.id)})]`;
     const fullTextExcerpt = doc.hasFullText && doc.fullText
       ? `\n- PMC Open-Access Full-Text Excerpt (${doc.pmcid || 'PMC'}):\n${doc.fullText.slice(0, 3500)}`
       : '';
     return `### Source ${idx + 1}: ${citationKey}
 - Title: ${doc.title}
 - Authors: ${doc.authors.slice(0, 5).join(', ')} et al.
-- Journal: ${doc.journal} (${doc.year})
+- Journal: ${doc.journal} (${yearLabel})
 - DOI: ${doc.doi || 'N/A'}${doc.pmid ? ` | PMID: ${doc.pmid}` : ''}${doc.pmcid ? ` | PMCID: ${doc.pmcid}` : ''}
 - Study Design: ${doc.pico.design}
 - Population (N): ${doc.pico.population} (N = ${doc.pico.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'})
 - Intervention: ${doc.pico.intervention}
 - Comparator: ${doc.pico.comparator}
 - Outcome: ${doc.pico.primaryOutcome}
-- Quantitative Metrics: ${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.riskRatio ? `RR: ${doc.pico.riskRatio}, ` : ''}${doc.pico.pValues.length > 0 ? doc.pico.pValues.join(', ') : 'p-value: Not reported'}
+- Quantitative Metrics: ${doc.pico.primaryStatistic ? `Primary Stat: ${doc.pico.primaryStatistic}, ` : ''}${doc.pico.hazardRatio ? `HR: ${doc.pico.hazardRatio}, ` : ''}${doc.pico.riskRatio ? `RR: ${doc.pico.riskRatio}, ` : ''}${doc.pico.pValues.length > 0 ? doc.pico.pValues.join(', ') : 'p-value: Not reported'}
 - Abstract: ${doc.abstract || 'Not reported in source metadata.'}${fullTextExcerpt}
 `;
   }).join('\n---\n');

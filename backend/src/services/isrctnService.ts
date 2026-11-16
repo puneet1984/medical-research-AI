@@ -3,7 +3,8 @@ import {
   decodeHtmlEntities,
   sanitizeAuthorsList,
   resolveAuthorOrJournalFallback,
-  sanitizeDoi
+  sanitizeDoi,
+  parseValidPublicationYear
 } from './corpusContextBuilder.js';
 import { apiCache } from '../utils/apiCache.js';
 import { config } from '../config.js';
@@ -18,7 +19,7 @@ export interface ParsedIsrctnRecord {
   authors: string[];
   firstAuthor: string;
   journal: 'ISRCTN Clinical Trial Registry';
-  year: number;
+  year: number | null;
   doi: string;
   nctId?: string;
   studyDesign: PicoData['design'];
@@ -146,17 +147,17 @@ export function parseIsrctnXmlResponse(xmlPayload: string, expectedIsrctnId?: st
       ? parsedTarget
       : 0;
 
-  // Publication Year
+  // Publication Year (never default to current year if missing)
   const dateCandidates = [
     extractFirstTagText(trialXml, 'overallEndDate'),
     extractFirstTagText(trialXml, 'recruitmentStart'),
     trialXml.match(/lastUpdated\s*=\s*["'](\d{4})/i)?.[1] || ''
   ];
-  let year = new Date().getFullYear();
+  let year: number | null = null;
   for (const dc of dateCandidates) {
-    const ym = dc.match(/\b(19|20)\d{2}\b/);
-    if (ym) {
-      year = parseInt(ym[0], 10);
+    const parsed = parseValidPublicationYear(dc);
+    if (parsed !== null) {
+      year = parsed;
       break;
     }
   }
@@ -184,9 +185,10 @@ export function parseIsrctnXmlResponse(xmlPayload: string, expectedIsrctnId?: st
   const nctId = /^NCT\d{8}$/.test(rawNct) ? rawNct : undefined;
 
   const pubArea = [
-    extractFirstTagText(trialXml, 'publicationDetails'),
-    extractFirstTagText(trialXml, 'outputs'),
-    extractFirstTagText(trialXml, 'results'),
+    ...extractAllTagTexts(trialXml, 'publicationDetails'),
+    ...extractAllTagTexts(trialXml, 'outputs'),
+    ...extractAllTagTexts(trialXml, 'results'),
+    ...extractAllTagTexts(trialXml, 'publication'),
     ...extractAllTagTexts(trialXml, 'externalLink')
   ].join(' ');
 
@@ -373,6 +375,7 @@ export async function enrichIsrctnRecords(studies: MedicalDocument[], maxToEnric
 
     return {
       ...doc,
+      year: doc.year ?? reg.year ?? null,
       isrctnId: matchedId,
       isrctnVerified: true,
       nctId: doc.nctId || reg.nctId,

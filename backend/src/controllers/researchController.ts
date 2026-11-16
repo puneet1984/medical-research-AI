@@ -10,6 +10,7 @@ import { upsertDocuments, searchSimilar, findCachedSimilar, getVectorStatus, ini
 import { synthesizeLiterature } from '../agents/synthesisAgent.js';
 import { deduplicateAndMergeStudies } from '../utils/deduplicateStudies.js';
 import { fetchRelatedAndCitingArticles } from '../services/pubmedLinkService.js';
+import { generateLocalEmbedding, cosineSimilarity } from '../services/embeddingService.js';
 
 interface SessionQueryStudies {
   query: string;
@@ -17,6 +18,30 @@ interface SessionQueryStudies {
   createdAt: number;
 }
 const sessionStudyRegistry = new Map<string, SessionQueryStudies>();
+
+function computeTrueSimilarityScore(doc: MedicalDocument, queryVector: number[]): number {
+  const rawAbstract = (doc.abstract || '').trim();
+  const hasMeaningfulAbstract =
+    (rawAbstract.length >= 25 && !/^abstract not reported/i.test(rawAbstract)) ||
+    Boolean(doc.hasFullText && doc.fullText && doc.fullText.trim().length >= 50);
+
+  const docText = hasMeaningfulAbstract
+    ? `${doc.title || ''} ${rawAbstract} ${doc.fullText ? doc.fullText.slice(0, 2500) : ''}`.trim()
+    : (doc.title || '').trim();
+
+  if (!docText) return 0.05;
+  const docVec = generateLocalEmbedding(docText, queryVector.length);
+  const rawSim = Math.max(0, cosineSimilarity(queryVector, docVec));
+  const penalized = hasMeaningfulAbstract ? rawSim : rawSim * 0.65;
+  return Math.round(Math.min(0.99, Math.max(0.01, penalized)) * 10000) / 10000;
+}
+
+function compareByRelevanceThenRecency(a: MedicalDocument, b: MedicalDocument): number {
+  const scoreDiff = (b.score || 0) - (a.score || 0);
+  if (Math.abs(scoreDiff) > 0.002) return scoreDiff;
+  if ((b.year || 0) !== (a.year || 0)) return (b.year || 0) - (a.year || 0);
+  return (b.citationCount || 0) - (a.citationCount || 0);
+}
 
 export async function handleSearchAndIndex(req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
@@ -43,13 +68,14 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     const { allStudies: rawDocuments, totalAvailable } = await searchAllAvailableStudies(trimmedQuery, 500, 0);
 
     // Combine cached vector studies with live fetched documents, deduplicating & merging across PubMed, registries, and scholarly DBs
-    const combinedPool = deduplicateAndMergeStudies([...cachedVectorHits, ...rawDocuments]);
+    const queryVector = generateLocalEmbedding(trimmedQuery, 384);
+    const combinedPool = deduplicateAndMergeStudies([...cachedVectorHits, ...rawDocuments]).map(d => ({
+      ...d,
+      score: typeof d.score === 'number' && d.score > 0 ? d.score : computeTrueSimilarityScore(d, queryVector)
+    }));
 
-    // Order all available studies strictly recent to past (Year descending)
-    combinedPool.sort((a, b) => {
-      if (b.year !== a.year) return b.year - a.year;
-      return (b.citationCount || 0) - (a.citationCount || 0);
-    });
+    // Order all available studies primarily by clinical relevance (similarity descending), then recency
+    combinedPool.sort(compareByRelevanceThenRecency);
 
     // Save in session registry for on-demand lazy hydration and pagination ("load more")
     sessionStudyRegistry.set(trimmedQuery.toLowerCase(), {
@@ -68,7 +94,7 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
         filteredDocuments = filteredDocuments.filter(d => filters.designs.includes(d.pico?.design));
       }
       if (typeof filters.yearFrom === 'number' && filters.yearFrom > 1900) {
-        filteredDocuments = filteredDocuments.filter(d => d.year >= filters.yearFrom);
+        filteredDocuments = filteredDocuments.filter(d => typeof d.year === 'number' && d.year >= filters.yearFrom);
       }
       if (Array.isArray(filters.sourceDatabases) && filters.sourceDatabases.length > 0) {
         filteredDocuments = filteredDocuments.filter(d => filters.sourceDatabases.includes(d.source));
@@ -86,20 +112,21 @@ export async function handleSearchAndIndex(req: Request, res: Response): Promise
     // 4. Agentic Step 4: Semantic Vector Ranking
     const rankedResults = await searchSimilar(trimmedQuery, Math.max(initialBatch.length, 40));
 
-    // Ensure all items in initialBatch have similarity scores and remain ordered recent to past
+    // Ensure all items in initialBatch carry uniform 384-d real similarity scores across every source (never a flat 0.75 fallback)
     const finalDocuments: MedicalDocument[] = initialBatch.map(doc => {
       const hit = rankedResults.find(r => r.document.id === doc.id || (doc.doi && r.document.doi === doc.doi));
+      const trueScore =
+        typeof doc.score === 'number' && doc.score > 0
+          ? doc.score
+          : (hit && typeof hit.score === 'number' && hit.score > 0 ? hit.score : computeTrueSimilarityScore(doc, queryVector));
       return {
         ...doc,
-        score: hit ? hit.score : doc.score || 0.75
+        score: trueScore
       };
     });
 
-    // Sort extracted sources based on recent to past (Year descending, then score)
-    finalDocuments.sort((a, b) => {
-      if (b.year !== a.year) return b.year - a.year;
-      return (b.score || 0) - (a.score || 0);
-    });
+    // Sort extracted sources primarily by Relevance Score (sim descending), tie-breaking by Year descending
+    finalDocuments.sort(compareByRelevanceThenRecency);
 
     // User-Requested Behavior: Do NOT autogenerate clinical report in the initial pipeline.
     // Execute MeSH & UMLS query expansion, multi-database retrieval, and PICO data matrix extraction.
@@ -166,6 +193,8 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
 
     let pool = session.allStudies;
 
+    const queryVector = generateLocalEmbedding(query.trim(), 384);
+
     // Check if remaining in pool is less than requested batch size
     const remainingInPool = pool.length - currentOffset;
     if (remainingInPool < size) {
@@ -177,13 +206,12 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
 
         if (nextLiveStudies && nextLiveStudies.length > 0) {
           const prevCount = pool.length;
-          pool = deduplicateAndMergeStudies([...pool, ...nextLiveStudies]);
+          pool = deduplicateAndMergeStudies([...pool, ...nextLiveStudies]).map(d => ({
+            ...d,
+            score: typeof d.score === 'number' && d.score > 0 ? d.score : computeTrueSimilarityScore(d, queryVector)
+          }));
           if (pool.length > prevCount) {
-            // Re-sort recent to past
-            pool.sort((a, b) => {
-              if (b.year !== a.year) return b.year - a.year;
-              return (b.citationCount || 0) - (a.citationCount || 0);
-            });
+            pool.sort(compareByRelevanceThenRecency);
             session.allStudies = pool;
             sessionStudyRegistry.set(trimmedQuery, session);
             console.log(`[researchController] Added ${pool.length - prevCount} new unique studies to session pool. Total pool: ${pool.length}`);
@@ -202,23 +230,23 @@ export async function handleLoadMoreStudies(req: Request, res: Response): Promis
         pool = pool.filter(d => filters.designs.includes(d.pico?.design));
       }
       if (typeof filters.yearFrom === 'number' && filters.yearFrom > 1900) {
-        pool = pool.filter(d => d.year >= filters.yearFrom);
+        pool = pool.filter(d => typeof d.year === 'number' && d.year >= filters.yearFrom);
       }
       if (Array.isArray(filters.sourceDatabases) && filters.sourceDatabases.length > 0) {
         pool = pool.filter(d => filters.sourceDatabases.includes(d.source));
       }
     }
 
-    const batch = pool.slice(currentOffset, currentOffset + size);
+    const batch = pool.slice(currentOffset, currentOffset + size).map(d => ({
+      ...d,
+      score: typeof d.score === 'number' && d.score > 0 ? d.score : computeTrueSimilarityScore(d, queryVector)
+    }));
 
     // Vector embed and upsert this next batch into vector storage with rolling FIFO checks
     const upsertResult = await upsertDocuments(batch);
 
-    // Ensure sorted recent to past
-    batch.sort((a, b) => {
-      if (b.year !== a.year) return b.year - a.year;
-      return (b.citationCount || 0) - (a.citationCount || 0);
-    });
+    // Keep ordered primarily by Relevance (score descending)
+    batch.sort(compareByRelevanceThenRecency);
 
     const newNextOffset = currentOffset + batch.length;
     // Allow more if pool has more OR if batch returned full size (live APIs can provide even more)

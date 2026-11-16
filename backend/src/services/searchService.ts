@@ -2,16 +2,24 @@ import { config } from '../config.js';
 import { GoogleGenAI } from '@google/genai';
 import { extractMetaMapLiteConcepts } from './metaMapLiteService.js';
 import { enrichArticlesWithFullText, FullTextSections } from './pmcFullTextService.js';
-import { searchClinicalTrials, enrichNctRecords } from './clinicalTrialsService.js';
+import {
+  searchClinicalTrials,
+  enrichNctRecords,
+  splitClinicalQueryForCtGov,
+  doesTrialMatchConceptIntersection,
+  computeCtGovSimilarityScore
+} from './clinicalTrialsService.js';
 import { enrichIsrctnRecords } from './isrctnService.js';
 import { deduplicateAndMergeStudies } from '../utils/deduplicateStudies.js';
+import { generateLocalEmbedding, cosineSimilarity } from './embeddingService.js';
 import {
   decodeHtmlEntities,
   sanitizeJournalField,
   sanitizeDoi,
   sanitizeUrlField,
   sanitizeAuthorsList,
-  resolveAuthorOrJournalFallback
+  resolveAuthorOrJournalFallback,
+  parseValidPublicationYear
 } from './corpusContextBuilder.js';
 
 export interface Author {
@@ -28,10 +36,12 @@ export interface PicoData {
   pValues: string[];
   hazardRatio?: string;
   riskRatio?: string;
+  primaryStatistic?: string;
   design:
     | 'Randomized Controlled Trial'
     | 'Meta-Analysis'
     | 'Systematic Review'
+    | 'Review Article'
     | 'Cohort Study'
     | 'Clinical Trial'
     | 'Case Report'
@@ -60,7 +70,7 @@ export interface MedicalDocument {
   authors: string[];
   firstAuthor: string;
   journal: string;
-  year: number;
+  year: number | null;
   doi: string;
   pmid?: string;
   pmcid?: string;
@@ -293,13 +303,68 @@ export function extractPValues(text: string, maxValues = 4, _fallbackIfEmpty = f
 
 /**
  * Determines study design tier from title, abstract, and MeSH / PublicationType tags.
- * Never blindly defaults non-trial / preclinical / consensus papers to "Clinical Trial".
+ * Checks explicit design phrases in the Title & PublicationType/MeSH tags FIRST,
+ * and guards Preclinical classification when human clinical indicators are present.
  */
 export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes = ''): PicoData['design'] {
-  const titleAndTags = `${title || ''} ${meshOrPubTypes || ''}`.toLowerCase();
-  const combined = `${title || ''} ${abstract || ''} ${meshOrPubTypes || ''}`.toLowerCase();
+  const titleLower = (title || '').toLowerCase();
+  const tagsLower = (meshOrPubTypes || '').toLowerCase();
+  const titleAndTags = `${titleLower} ${tagsLower}`.trim();
+  const combined = `${titleLower} ${abstract || ''} ${tagsLower}`.toLowerCase();
 
-  // 1. Systematic Review & Meta-Analysis
+  // Phase 1: Title & PublicationType/MeSH explicit design phrases ALWAYS take precedence
+  if (/\b(?:meta-analysis|meta\s+analysis|pooled\s+analysis|meta-analytic|network\s+meta-analysis)\b/i.test(titleAndTags)) {
+    return 'Meta-Analysis';
+  }
+  if (/\b(?:systematic\s+review|scoping\s+review|cochrane\s+review|umbrella\s+review)\b/i.test(titleAndTags)) {
+    return 'Systematic Review';
+  }
+  if (
+    /\b(?:randomized\s+controlled\s+trial|randomised\s+controlled\s+trial|randomized\s+clinical\s+trial|randomised\s+clinical\s+trial|placebo-controlled\s+trial|double-blind\s+trial|\brct\b)\b/i.test(
+      titleAndTags
+    )
+  ) {
+    return 'Randomized Controlled Trial';
+  }
+  if (/\bcase\s+series\b/i.test(titleAndTags)) {
+    return 'Case Series';
+  }
+  if (/\b(?:case\s+report|case\s+reports)\b/i.test(titleAndTags) || /\ba\s+case\s+of\b/i.test(titleLower)) {
+    return 'Case Report';
+  }
+  if (
+    /\b(?:narrative\s+review|current\s+concepts\s+review|clinical\s+review|literature\s+review|state[- ]of[- ]the[- ]art\s+review|invited\s+review|review\s+article)\b/i.test(
+      titleAndTags
+    )
+  ) {
+    return 'Review Article';
+  }
+  if (
+    /\b(?:retrospective\s+cohort|prospective\s+cohort|cohort\s+study|cohort\s+studies|case-control\s+study|observational\s+study|comparative\s+cohort|longitudinal\s+study)\b/i.test(
+      titleAndTags
+    )
+  ) {
+    return 'Cohort Study';
+  }
+  if (
+    /\b(?:clinical\s+trial|phase\s*(?:i|ii|iii|iv|1|2|3|4)(?:\s*\/\s*(?:i|ii|iii|iv|1|2|3|4))?\s+trial|prospective\s+trial|open-label\s+trial|interventional\s+trial|pilot\s+trial)\b/i.test(
+      titleAndTags
+    )
+  ) {
+    return 'Clinical Trial';
+  }
+  if (
+    /\b(?:consensus\s+statement|consensus\s+report|classification\s+system|clinical\s+practice\s+guideline|practice\s+guideline|classification|consensus|guideline|guidelines|editorial|position\s+statement|practice\s+parameter|commentary)\b/i.test(
+      titleAndTags
+    )
+  ) {
+    return 'Consensus / Classification Paper';
+  }
+  if (/\breview\b/i.test(titleLower) && !/\b(?:peer\s+review|institutional\s+review\s+board|ethics\s+review)\b/i.test(titleLower)) {
+    return 'Review Article';
+  }
+
+  // Phase 2: Abstract / full combined text classification
   if (combined.includes('meta-analysis') || combined.includes('pooled analysis') || combined.includes('meta-analytic')) {
     return 'Meta-Analysis';
   }
@@ -307,26 +372,23 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
     return 'Systematic Review';
   }
 
-  // 2. Preclinical / Experimental Study (animal models, murine, in vitro, cell line)
-  if (
+  // Preclinical / Experimental Study ONLY when animal/in vitro terms appear AND human clinical indicators are absent
+  const hasPreclinicalTerms =
     /\b(?:murine|mice|mouse|rats?|rodent|animal\s+model|animal\s+models|preclinical|in\s+vitro|ex\s+vivo|xenograft|cell\s+line|cell\s+lines)\b/i.test(
       combined
-    )
-  ) {
+    );
+  const hasHumanClinicalTerms =
+    /\b(?:patients|participants|human\s+subjects|retrospective\s+cohort|prospective\s+cohort|cohort\s+study|randomized|randomised|clinical\s+trial|clinical\s+review|narrative\s+review|current\s+concepts|systematic\s+review|meta-analysis|enrolled|hospitalized)\b/i.test(
+      combined
+    );
+  if (hasPreclinicalTerms && !hasHumanClinicalTerms) {
     return 'Preclinical / Experimental Study';
   }
 
-  // 3. Consensus / Classification / Guideline / Editorial Papers (checked via title/MeSH/PubTypes or explicit phrases)
-  if (
-    /\b(?:classification|consensus|guideline|guidelines|practice\s+guideline|editorial|position\s+statement|practice\s+parameter|commentary)\b/i.test(
-      titleAndTags
-    ) ||
-    /\b(?:consensus\s+statement|consensus\s+report|clinical\s+practice\s+guideline|classification\s+system)\b/i.test(combined)
-  ) {
+  if (/\b(?:consensus\s+statement|consensus\s+report|clinical\s+practice\s+guideline|classification\s+system)\b/i.test(combined)) {
     return 'Consensus / Classification Paper';
   }
 
-  // 4. Randomized Controlled Trial (human clinical RCTs)
   if (
     /\b(?:randomized|randomised|placebo-controlled|double-blind|rct|single-blind|controlled\s+clinical\s+trial)\b/i.test(
       combined
@@ -335,7 +397,6 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
     return 'Randomized Controlled Trial';
   }
 
-  // 5. Case Report & Case Series (Checked BEFORE general Cohort or Clinical Trial)
   if (
     /\bcase\s+series\b/i.test(combined) ||
     /\bseries\s+of\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+cases\b/i.test(combined) ||
@@ -357,7 +418,10 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
     return 'Case Report';
   }
 
-  // 6. Explicit Cohort / Observational / Case-Control Study (checked before generic "patients enrolled" unless explicitly labeled a clinical trial / phase trial)
+  if (/\b(?:narrative\s+review|current\s+concepts\s+review|literature\s+review|clinical\s+review|state[- ]of[- ]the[- ]art\s+review)\b/i.test(combined)) {
+    return 'Review Article';
+  }
+
   const hasExplicitTrialTerm =
     /\b(?:clinical\s+trial|phase\s*(?:i|ii|iii|iv|1|2|3|4)(?:\s*\/\s*(?:i|ii|iii|iv|1|2|3|4))?|prospective\s+trial|open-label\s+trial|controlled\s+trial|interventional\s+trial|pilot\s+trial)\b/i.test(
       combined
@@ -370,7 +434,6 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
     return 'Cohort Study';
   }
 
-  // 7. Human Clinical Trial (ONLY when explicit human clinical trial terms appear)
   if (
     hasExplicitTrialTerm ||
     /\b(?:patients\s+enrolled|randomized|randomised)\b/i.test(combined)
@@ -378,12 +441,10 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
     return 'Clinical Trial';
   }
 
-  // 8. Remaining prospective observational studies
   if (/\bprospective\b/i.test(combined)) {
     return 'Cohort Study';
   }
 
-  // 9. Non-trial unmatched default
   return 'Observational / Descriptive Study';
 }
 
@@ -577,6 +638,13 @@ export function extractPicoData(
     extractPrimaryOutcomeFromText(cleanAbstract)
   );
 
+  const primaryStatistic =
+    pValues.length > 0
+      ? pValues[0]
+      : hazardRatio
+      ? `HR ${hazardRatio}`
+      : riskRatio;
+
   return {
     population,
     sampleSize,
@@ -586,6 +654,7 @@ export function extractPicoData(
     pValues,
     hazardRatio,
     riskRatio,
+    primaryStatistic,
     design
   };
 }
@@ -709,87 +778,7 @@ async function searchPubMed(query: string, limit = 200, offset = 0): Promise<Med
       const xmlText = await fetchRes.text();
       articleBlocks.push(...xmlText.split(/<\/PubmedArticle>/i));
     }
-    const docs: MedicalDocument[] = [];
-
-    for (const block of articleBlocks) {
-      if (!block.includes('<PMID')) continue;
-
-      const pmidMatch = block.match(/<PMID[^>]*>(\d+)<\/PMID>/i);
-      const pmid = pmidMatch ? pmidMatch[1] : '';
-      if (!pmid) continue;
-
-      const titleMatch = block.match(/<ArticleTitle[^>]*>(.*?)<\/ArticleTitle>/is);
-      const title = decodeHtmlEntities(titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim().replace(/\.$/, '') : 'Clinical Study');
-
-      const journalMatch = block.match(/<Title[^>]*>(.*?)<\/Title>/i) || block.match(/<MedlineTA[^>]*>(.*?)<\/MedlineTA>/i);
-      const journal = sanitizeJournalField(journalMatch ? journalMatch[1] : 'PubMed Indexed Journal');
-
-      const yearMatch = block.match(/<JournalIssue[^>]*>.*?<PubDate>.*?<Year>(\d{4})<\/Year>/is) || block.match(/<Year>(\d{4})<\/Year>/i);
-      const year = yearMatch ? parseInt(yearMatch[1], 10) : new Date().getFullYear();
-
-      const doiMatch = block.match(/<ArticleId IdType="doi">([^<]+)<\/ArticleId>/i);
-      const doi = sanitizeDoi(doiMatch ? doiMatch[1].trim() : '');
-
-      const pmcMatch = block.match(/<ArticleId IdType="pmc">(?:PMC)?(\d+)<\/ArticleId>/i);
-      const pmcid = pmcMatch ? `PMC${pmcMatch[1].trim()}` : undefined;
-
-      // Extract authors (never substitute "Investigator" placeholder)
-      const rawAuthors: string[] = [];
-      const authorMatches = block.matchAll(/<Author[^>]*>.*?<LastName>(.*?)<\/LastName>.*?<ForeName>(.*?)<\/ForeName>.*?<\/Author>/gis);
-      for (const a of authorMatches) {
-        const formattedAuthor = decodeHtmlEntities(`${a[1]} ${a[2]?.charAt(0) || ''}`.trim());
-        if (formattedAuthor) rawAuthors.push(formattedAuthor);
-      }
-      if (rawAuthors.length === 0) {
-        const lastNames = block.matchAll(/<LastName>(.*?)<\/LastName>/gi);
-        for (const ln of lastNames) {
-          const decodedLn = decodeHtmlEntities(ln[1]);
-          if (decodedLn) rawAuthors.push(decodedLn);
-        }
-      }
-      const authors = sanitizeAuthorsList(rawAuthors);
-      const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
-
-      // Extract PubMed PublicationType & MeSH DescriptorName tags for accurate study-design classification
-      const pubTypes = [...block.matchAll(/<PublicationType[^>]*>(.*?)<\/PublicationType>/gi)]
-        .map(m => decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()))
-        .filter(Boolean);
-      const meshDescs = [...block.matchAll(/<DescriptorName[^>]*>(.*?)<\/DescriptorName>/gi)]
-        .map(m => decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()))
-        .filter(Boolean);
-      const meshTerms = Array.from(new Set([...pubTypes, ...meshDescs]));
-
-      // Extract full abstract (including labeled structured subsections)
-      const abstractParts: string[] = [];
-      const abstractMatches = block.matchAll(/<AbstractText(?:\s+Label="([^"]+)")?[^>]*>(.*?)<\/AbstractText>/gis);
-      for (const m of abstractMatches) {
-        const label = m[1] ? `${decodeHtmlEntities(m[1])}: ` : '';
-        const body = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '').trim());
-        if (body) abstractParts.push(`${label}${body}`);
-      }
-
-      const abstractText = abstractParts.join(' ');
-
-      docs.push({
-        id: `pmid-${pmid}`,
-        title,
-        authors: authors.slice(0, 8),
-        firstAuthor,
-        journal,
-        year,
-        doi,
-        pmid,
-        pmcid,
-        hasFullText: false,
-        abstract: abstractText,
-        citationCount: Math.floor(Math.random() * 150) + 20,
-        isOpenAccess: Boolean(pmcid) || block.includes('<ArticleId IdType="pmc">') || block.includes('Free PMC article'),
-        source: 'PubMed',
-        webUrl: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
-        meshTerms: meshTerms.slice(0, 20),
-        pico: extractPicoData(title, abstractText, undefined, false, meshTerms.join(' '))
-      });
-    }
+    const docs = parsePubMedXmlBlocks(articleBlocks);
 
     if (docs.length === 0 && pmids.length > 0) {
       return fetchPubMedSummaries(pmids, keyParam);
@@ -801,6 +790,159 @@ async function searchPubMed(query: string, limit = 200, offset = 0): Promise<Med
     return docs;
   } catch (err) {
     console.warn('[searchService] PubMed search warning:', err instanceof Error ? err.message : err);
+    return [];
+  }
+}
+
+function parsePubMedXmlBlocks(articleBlocks: string[]): MedicalDocument[] {
+  const docs: MedicalDocument[] = [];
+
+  for (const block of articleBlocks) {
+    if (!block.includes('<PMID')) continue;
+
+    const pmidMatch = block.match(/<PMID[^>]*>(\d+)<\/PMID>/i);
+    const pmid = pmidMatch ? pmidMatch[1] : '';
+    if (!pmid) continue;
+
+    const titleMatch = block.match(/<ArticleTitle[^>]*>(.*?)<\/ArticleTitle>/is);
+    const title = decodeHtmlEntities(titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim().replace(/\.$/, '') : 'Clinical Study');
+
+    const journalMatch = block.match(/<Title[^>]*>(.*?)<\/Title>/i) || block.match(/<MedlineTA[^>]*>(.*?)<\/MedlineTA>/i);
+    const journal = sanitizeJournalField(journalMatch ? journalMatch[1] : 'PubMed Indexed Journal');
+
+    const yearMatch =
+      block.match(/<JournalIssue[^>]*>.*?<PubDate>.*?<Year>(\d{4})<\/Year>/is) ||
+      block.match(/<JournalIssue[^>]*>.*?<PubDate>.*?<MedlineDate>([^<]+)<\/MedlineDate>/is) ||
+      block.match(/<Year>(\d{4})<\/Year>/i);
+    const year = parseValidPublicationYear(yearMatch?.[1]);
+
+    const doiMatch = block.match(/<ArticleId IdType="doi">([^<]+)<\/ArticleId>/i);
+    const doi = sanitizeDoi(doiMatch ? doiMatch[1].trim() : '');
+
+    const pmcMatch = block.match(/<ArticleId IdType="pmc">(?:PMC)?(\d+)<\/ArticleId>/i);
+    const pmcid = pmcMatch ? `PMC${pmcMatch[1].trim()}` : undefined;
+
+    // Extract authors (never substitute "Investigator" placeholder)
+    const rawAuthors: string[] = [];
+    const authorMatches = block.matchAll(/<Author[^>]*>.*?<LastName>(.*?)<\/LastName>.*?<ForeName>(.*?)<\/ForeName>.*?<\/Author>/gis);
+    for (const a of authorMatches) {
+      const formattedAuthor = decodeHtmlEntities(`${a[1]} ${a[2]?.charAt(0) || ''}`.trim());
+      if (formattedAuthor) rawAuthors.push(formattedAuthor);
+    }
+    if (rawAuthors.length === 0) {
+      const lastNames = block.matchAll(/<LastName>(.*?)<\/LastName>/gi);
+      for (const ln of lastNames) {
+        const decodedLn = decodeHtmlEntities(ln[1]);
+        if (decodedLn) rawAuthors.push(decodedLn);
+      }
+    }
+    const authors = sanitizeAuthorsList(rawAuthors);
+    const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
+
+    // Extract PubMed PublicationType & MeSH DescriptorName tags for accurate study-design classification
+    const pubTypes = [...block.matchAll(/<PublicationType[^>]*>(.*?)<\/PublicationType>/gi)]
+      .map(m => decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()))
+      .filter(Boolean);
+    const meshDescs = [...block.matchAll(/<DescriptorName[^>]*>(.*?)<\/DescriptorName>/gi)]
+      .map(m => decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()))
+      .filter(Boolean);
+    const meshTerms = Array.from(new Set([...pubTypes, ...meshDescs]));
+
+    // Extract full abstract (including labeled structured subsections)
+    const abstractParts: string[] = [];
+    const abstractMatches = block.matchAll(/<AbstractText(?:\s+Label="([^"]+)")?[^>]*>(.*?)<\/AbstractText>/gis);
+    for (const m of abstractMatches) {
+      const label = m[1] ? `${decodeHtmlEntities(m[1])}: ` : '';
+      const body = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '').trim());
+      if (body) abstractParts.push(`${label}${body}`);
+    }
+
+    const abstractText = abstractParts.join(' ');
+
+    docs.push({
+      id: `pmid-${pmid}`,
+      title,
+      authors: authors.slice(0, 8),
+      firstAuthor,
+      journal,
+      year,
+      doi,
+      pmid,
+      pmcid,
+      hasFullText: false,
+      abstract: abstractText,
+      citationCount: Math.floor(Math.random() * 150) + 20,
+      isOpenAccess: Boolean(pmcid) || block.includes('<ArticleId IdType="pmc">') || block.includes('Free PMC article'),
+      source: 'PubMed',
+      webUrl: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+      meshTerms: meshTerms.slice(0, 20),
+      pico: extractPicoData(title, abstractText, undefined, false, meshTerms.join(' '))
+    });
+  }
+
+  return docs;
+}
+
+/**
+ * Fetches full PubMed EFetch XML metadata & PMC full text for an explicit list of PMIDs
+ * (used to auto-hydrate linked trial-result publications from ClinicalTrials.gov and ISRCTN).
+ */
+export async function fetchPubMedArticlesByPmids(pmids: string[]): Promise<MedicalDocument[]> {
+  const cleanPmids = Array.from(new Set(pmids.map(p => String(p || '').trim()).filter(p => /^\d+$/.test(p))));
+  if (cleanPmids.length === 0) return [];
+
+  const keyParam = config.ncbiApiKey ? `&api_key=${encodeURIComponent(config.ncbiApiKey)}` : '';
+  const EFETCH_CHUNK_SIZE = 150;
+  const articleBlocks: string[] = [];
+
+  try {
+    for (let i = 0; i < cleanPmids.length; i += EFETCH_CHUNK_SIZE) {
+      const chunkIds = cleanPmids.slice(i, i + EFETCH_CHUNK_SIZE);
+      await waitForNcbiRateLimit();
+      const efetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${chunkIds.join(',')}&retmode=xml&tool=MedResearchAI&email=${encodeURIComponent(config.scholarlyEmail)}${keyParam}`;
+      const fetchRes = await fetch(efetchUrl, {
+        headers: { 'User-Agent': `MedResearchAI/1.0 (mailto:${config.scholarlyEmail})` },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!fetchRes.ok) continue;
+      const xmlText = await fetchRes.text();
+      articleBlocks.push(...xmlText.split(/<\/PubmedArticle>/i));
+    }
+
+    const docs = parsePubMedXmlBlocks(articleBlocks);
+    if (docs.length > 0) {
+      await applyPmcFullTextEnrichment(docs, Math.min(25, docs.length));
+    }
+    return docs;
+  } catch (err) {
+    console.warn('[searchService] fetchPubMedArticlesByPmids notice:', err instanceof Error ? err.message : err);
+    return [];
+  }
+}
+
+/**
+ * Resolves linked DOIs into numeric PMIDs via NCBI ESearch so trial-linked result DOIs
+ * can be hydrated from PubMed/PMC.
+ */
+export async function resolveDoisToPmids(dois: string[]): Promise<string[]> {
+  const cleanDois = Array.from(new Set(dois.map(d => sanitizeDoi(d)).filter(Boolean))).slice(0, 10);
+  if (cleanDois.length === 0) return [];
+
+  try {
+    await waitForNcbiRateLimit();
+    const keyParam = config.ncbiApiKey ? `&api_key=${encodeURIComponent(config.ncbiApiKey)}` : '';
+    const doiQuery = cleanDois.map(d => `"${d}"[DOI]`).join(' OR ');
+    const esearchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(doiQuery)}&retmode=json&retmax=20&tool=MedResearchAI&email=${encodeURIComponent(config.scholarlyEmail)}${keyParam}`;
+    const res = await fetch(esearchUrl, {
+      headers: { 'User-Agent': `MedResearchAI/1.0 (mailto:${config.scholarlyEmail})` },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as any;
+    const idList: unknown[] = Array.isArray(data?.esearchresult?.idlist) ? data.esearchresult.idlist : [];
+    return idList.map(id => String(id).trim()).filter(id => /^\d+$/.test(id));
+  } catch (err) {
+    console.warn('[searchService] resolveDoisToPmids notice:', err instanceof Error ? err.message : err);
     return [];
   }
 }
@@ -844,13 +986,20 @@ async function applyPmcFullTextEnrichment(docs: MedicalDocument[], maxToEnrich =
         doc.isOpenAccess = true;
         // Re-extract PICO metrics prioritizing full-text Methods, Results, and Tables, preserving existing non-empty fields
         const fullPico = extractPicoData(doc.title, doc.abstract, doc.fullTextSections, true, (doc.meshTerms || []).join(' '));
+        const mergedPValues = fullPico.pValues.length > 0 ? fullPico.pValues : (doc.pico?.pValues || []);
+        const mergedHr = fullPico.hazardRatio || doc.pico?.hazardRatio;
+        const mergedRr = fullPico.riskRatio || doc.pico?.riskRatio;
         doc.pico = {
           ...fullPico,
           sampleSize: fullPico.sampleSize > 0 ? fullPico.sampleSize : (doc.pico?.sampleSize || 0),
           population: fullPico.population !== 'Not reported' ? fullPico.population : (doc.pico?.population || 'Not reported'),
           intervention: fullPico.intervention !== 'Not reported' ? fullPico.intervention : (doc.pico?.intervention || 'Not reported'),
           comparator: fullPico.comparator !== 'Not reported' ? fullPico.comparator : (doc.pico?.comparator || 'Not reported'),
-          primaryOutcome: fullPico.primaryOutcome !== 'Not reported' ? fullPico.primaryOutcome : (doc.pico?.primaryOutcome || 'Not reported')
+          primaryOutcome: fullPico.primaryOutcome !== 'Not reported' ? fullPico.primaryOutcome : (doc.pico?.primaryOutcome || 'Not reported'),
+          pValues: mergedPValues,
+          hazardRatio: mergedHr,
+          riskRatio: mergedRr,
+          primaryStatistic: fullPico.primaryStatistic || doc.pico?.primaryStatistic || mergedHr || mergedRr
         };
       } else {
         doc.hasFullText = false;
@@ -879,7 +1028,7 @@ async function fetchPubMedSummaries(pmids: string[], keyParam: string): Promise<
       const authors = sanitizeAuthorsList((item.authors || []).map((a: any) => decodeHtmlEntities(a.name || '')));
       const journal = sanitizeJournalField(item.fulljournalname || item.source || 'Medical Journal');
       const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
-      const year = parseInt(item.pubdate?.slice(0, 4), 10) || new Date().getFullYear();
+      const year = parseValidPublicationYear(item.pubdate);
       let doi = '';
       let pmcid: string | undefined;
       if (Array.isArray(item.articleids)) {
@@ -953,7 +1102,7 @@ async function searchDoaj(query: string, limit = 20, offset = 0): Promise<Medica
       const authors = sanitizeAuthorsList((b.author || []).map((a: any) => decodeHtmlEntities(a.name || '')));
       const journal = sanitizeJournalField(b.journal?.title || 'Open Access Journal');
       const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
-      const year = parseInt(b.year, 10) || new Date().getFullYear();
+      const year = parseValidPublicationYear(b.year);
 
       let doi = '';
       if (Array.isArray(b.identifier)) {
@@ -1014,9 +1163,9 @@ async function searchCrossref(query: string, limit = 25, offset = 0): Promise<Me
       const title = decodeHtmlEntities(((item.title && item.title[0]) || 'Clinical Investigation').replace(/<[^>]+>/g, ' '));
       const publisher = decodeHtmlEntities(item.publisher || '');
       const journal = sanitizeJournalField((item['container-title'] && item['container-title'][0]) || publisher || 'Biomedical Journal');
-      const year = item['published-print']?.['date-parts']?.[0]?.[0] ||
-        item['published-online']?.['date-parts']?.[0]?.[0] ||
-        new Date().getFullYear();
+      const year =
+        parseValidPublicationYear(item['published-print']?.['date-parts']?.[0]?.[0]) ??
+        parseValidPublicationYear(item['published-online']?.['date-parts']?.[0]?.[0]);
 
       const authors = sanitizeAuthorsList(
         (item.author || []).map((a: any) => decodeHtmlEntities(`${a.family || ''} ${a.given ? a.given.charAt(0) : ''}`.trim()))
@@ -1105,7 +1254,7 @@ FINDINGS: <brief clinical population, intervention, primary outcome, and p-value
       if (titleMatch && titleMatch[1]) {
         const title = decodeHtmlEntities(titleMatch[1].trim());
         const journal = sanitizeJournalField((journalMatch && journalMatch[1]?.trim()) || 'Clinical Journal');
-        const year = yearMatch ? parseInt(yearMatch[1], 10) : new Date().getFullYear();
+        const year = parseValidPublicationYear(yearMatch?.[1]);
         const authorStr = decodeHtmlEntities((authorsMatch && authorsMatch[1]?.trim()) || '');
         const authors = sanitizeAuthorsList(authorStr.split(/,|;/).map(a => a.trim()));
         const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
@@ -1180,7 +1329,7 @@ async function searchOpenAlex(query: string, limit = 25, offset = 0): Promise<Me
       const abstract = decodeHtmlEntities(reconstructOpenAlexAbstract(item.abstract_inverted_index));
       const authors = sanitizeAuthorsList((item.authorships || []).map((a: any) => decodeHtmlEntities(a.author?.display_name || '')));
       const title = decodeHtmlEntities(item.title || 'Untitled Clinical Study');
-      const year = item.publication_year || new Date().getFullYear();
+      const year = parseValidPublicationYear(item.publication_year);
       const doi = sanitizeDoi(item.doi || '');
       const journal = sanitizeJournalField(item.primary_location?.source?.display_name || 'Biomedical Journal');
       const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
@@ -1234,7 +1383,7 @@ export async function fetchLandmarkTrialsFromAPI(query: string, limit = 15): Pro
           const abstract = decodeHtmlEntities(reconstructOpenAlexAbstract(item.abstract_inverted_index));
           const authors = sanitizeAuthorsList((item.authorships || []).map((a: any) => decodeHtmlEntities(a.author?.display_name || '')));
           const title = decodeHtmlEntities(item.title || 'Landmark Clinical Investigation');
-          const year = item.publication_year || new Date().getFullYear();
+          const year = parseValidPublicationYear(item.publication_year);
           const doi = sanitizeDoi(item.doi || '');
           const journal = sanitizeJournalField(item.primary_location?.source?.display_name || 'Major Medical Journal');
           const firstAuthor = resolveAuthorOrJournalFallback({ firstAuthor: '', authors, journal });
@@ -1325,6 +1474,21 @@ export function filterAndRankByClinicalRelevance(
     expansions.push('proximal femoral nail', 'proximal femur nail', 'intramedullary nail', 'femoral nail');
   }
 
+  // Core non-acronym domain terms (>4 chars) from query + expansions to prevent short acronym collisions (e.g. FRI-247)
+  const uniqueExpansions = Array.from(new Set(expansions.filter(e => e.length > 4)));
+  const shortTokens = queryTokens.filter(t => t.length <= 4);
+  const longQueryTokens = queryTokens.filter(t => t.length > 4);
+  const coreDomainTerms = Array.from(
+    new Set(
+      [
+        ...longQueryTokens,
+        ...uniqueExpansions
+          .flatMap(exp => exp.split(/[^a-z0-9]+/))
+          .filter(w => w.length > 4 && !stopWords.has(w))
+      ]
+    )
+  );
+
   // Disjoint medical domains that must NOT contaminate focused searches
   const disjointTopics = [
     'denture', 'dentistry', 'prosthodontic', 'periodontitis', 'sinus floor', 'sinus augmentation',
@@ -1334,72 +1498,133 @@ export function filterAndRankByClinicalRelevance(
     'prostate cancer', 'colorectal'
   ];
 
-  // Only apply negative penalty if user didn't ask for that word
   const activeNegatives = disjointTopics.filter(d => !qClean.includes(d));
+  const queryVector = generateLocalEmbedding(query, 384);
+
+  const stripPosterCodes = (rawText: string) => rawText.replace(/\b[a-z]{2,5}-\d{2,6}\b/gi, ' ');
+  const tokenMatches = (token: string, cleanedText: string): boolean => {
+    if (token.length <= 4) {
+      const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`(?:^|[^a-z0-9-])${escaped}(?![a-z0-9-]|-?\\d)`, 'i').test(cleanedText);
+    }
+    return cleanedText.includes(token);
+  };
 
   const scoredDocs: Array<{ doc: MedicalDocument; relevanceScore: number }> = [];
 
   for (const doc of documents) {
-    const text = (doc.title + ' ' + (doc.abstract || '') + ' ' + (doc.journal || '')).toLowerCase();
+    const rawAbs = (doc.abstract || '').trim();
+    const hasMeaningfulAbstract =
+      rawAbs.length >= 25 &&
+      !/^abstract not reported in source metadata\.?$/i.test(rawAbs) &&
+      !/^not reported in the retrieved studies\.?$/i.test(rawAbs);
+
+    const rawText = [
+      doc.title || '',
+      hasMeaningfulAbstract ? rawAbs : '',
+      doc.journal || '',
+      doc.fullText ? doc.fullText.slice(0, 2500) : ''
+    ].join(' ').toLowerCase();
+    const cleanedText = stripPosterCodes(rawText);
 
     // 1. Strict veto: immediately discard any paper from disjoint medical domains
     let hasDisjoint = false;
     for (const neg of activeNegatives) {
-      if (text.includes(neg)) {
+      if (cleanedText.includes(neg)) {
         hasDisjoint = true;
         break;
       }
     }
     if (hasDisjoint) {
-      // Discard immediately: never allow dentures, lumbar discectomy, septic shock, or oncology into focused queries
       continue;
     }
 
-    let directHits = 0;
+    let directLongHits = 0;
+    let directShortHits = 0;
     for (const t of queryTokens) {
-      if (text.includes(t)) directHits++;
+      if (tokenMatches(t, cleanedText)) {
+        if (t.length <= 4) directShortHits++;
+        else directLongHits++;
+      }
     }
+    const directHits = directLongHits + directShortHits;
 
     let expansionHits = 0;
-    for (const exp of expansions) {
-      if (text.includes(exp)) expansionHits++;
+    for (const exp of uniqueExpansions) {
+      if (cleanedText.includes(exp)) expansionHits++;
     }
 
-    // 2. Scoring logic
-    if (queryTokens.length >= 2) {
-      // Comparison or multi-term query (e.g. DHS vs PFN)
-      if (directHits >= 2) {
-        // High priority: matches both terms
-        const pubmedBonus = doc.source === 'PubMed' ? 25 : 0;
-        scoredDocs.push({ doc, relevanceScore: 100 + directHits * 10 + expansionHits * 5 + pubmedBonus });
-      } else if (directHits === 1 && (expansionHits > 0 || doc.source === 'PubMed')) {
-        const pubmedBonus = doc.source === 'PubMed' ? 30 : 0;
-        scoredDocs.push({ doc, relevanceScore: 60 + expansionHits * 5 + pubmedBonus });
-      } else if (directHits === 0 && expansionHits >= 2) {
-        scoredDocs.push({ doc, relevanceScore: 40 + expansionHits * 5 });
-      } else {
-        // Neither query term is adequately supported: discard
-        continue;
-      }
-    } else if (queryTokens.length === 1) {
-      if (directHits > 0) {
-        scoredDocs.push({ doc, relevanceScore: 80 + directHits * 10 + expansionHits * 5 });
-      } else if (expansionHits > 0) {
-        scoredDocs.push({ doc, relevanceScore: 30 + expansionHits * 5 });
-      } else {
-        continue;
-      }
-    } else {
-      scoredDocs.push({ doc, relevanceScore: 10 });
+    let coreDomainHits = 0;
+    for (const core of coreDomainTerms) {
+      if (cleanedText.includes(core)) coreDomainHits++;
     }
+
+    // Prevent short acronym collisions (e.g. matching "FRI" only without any core anatomical/clinical domain term)
+    if (shortTokens.length > 0 && coreDomainTerms.length > 0 && directLongHits === 0 && coreDomainHits === 0) {
+      continue;
+    }
+
+    // Check minimum token/expansion support
+    if (queryTokens.length >= 2) {
+      const supported =
+        directHits >= 2 ||
+        (directHits === 1 && (expansionHits > 0 || coreDomainHits > 0 || doc.source === 'PubMed')) ||
+        (directHits === 0 && expansionHits >= 2);
+      if (!supported) continue;
+    } else if (queryTokens.length === 1) {
+      if (directHits === 0 && expansionHits === 0) continue;
+    }
+
+    // Strict multi-concept intersection for ClinicalTrials.gov registry records:
+    // must match BOTH condition concept AND intervention concept when both are present.
+    if (doc.source === 'ClinicalTrials.gov') {
+      const { condTerms, intrTerms } = splitClinicalQueryForCtGov(query, metaMapResult);
+      if (condTerms.length > 0 && intrTerms.length > 0) {
+        const { matchesCond, matchesIntr } = doesTrialMatchConceptIntersection(doc, condTerms, intrTerms);
+        if (!matchesCond || !matchesIntr) {
+          continue;
+        }
+      }
+    }
+
+    // 2. Real Cosine Similarity (never a flat 0.75 fallback)
+    const embedInput =
+      hasMeaningfulAbstract || doc.hasFullText
+        ? `${doc.title} ${rawAbs} ${doc.fullText ? doc.fullText.slice(0, 2500) : ''}`.slice(0, 3200)
+        : doc.title;
+    const docVec = generateLocalEmbedding(embedInput, 384);
+    const rawCosine = Math.max(0, cosineSimilarity(queryVector, docVec));
+
+    const tokenCoverage = queryTokens.length > 0 ? directHits / queryTokens.length : 0.5;
+    const expansionCoverage = uniqueExpansions.length > 0 ? Math.min(1, expansionHits / Math.min(3, uniqueExpansions.length)) : 0;
+    const fullTextBonus = doc.hasFullText ? 0.04 : 0;
+
+    let computedSim =
+      rawCosine * 0.55 +
+      tokenCoverage * 0.30 +
+      expansionCoverage * 0.15 +
+      fullTextBonus;
+
+    // Missing-abstract penalty: empty-abstract records are scored strictly from title * 0.65
+    if (!hasMeaningfulAbstract && !doc.hasFullText) {
+      computedSim = computedSim * 0.65;
+    }
+
+    const boundedScore = Number(Math.min(0.99, Math.max(0.01, computedSim)).toFixed(4));
+    scoredDocs.push({
+      doc: { ...doc, score: boundedScore },
+      relevanceScore: boundedScore
+    });
   }
 
-  // Sort by relevance score descending, then by year descending (recent to past), then citations
+  // Sort primarily by Relevance Score descending, with Year & Citation Count tie-breakers
   scoredDocs.sort((a, b) => {
-    if (Math.abs(b.relevanceScore - a.relevanceScore) >= 20) {
+    if (Math.abs(b.relevanceScore - a.relevanceScore) > 0.005) {
       return b.relevanceScore - a.relevanceScore;
     }
-    if (b.doc.year !== a.doc.year) return b.doc.year - a.doc.year;
+    if ((b.doc.year || 0) !== (a.doc.year || 0)) {
+      return (b.doc.year || 0) - (a.doc.year || 0);
+    }
     return (b.doc.citationCount || 0) - (a.doc.citationCount || 0);
   });
 
@@ -1407,8 +1632,8 @@ export function filterAndRankByClinicalRelevance(
 }
 
 /**
- * Master Search Service: Retrieves all available studies across PubMed, OpenAlex, DOAJ, Scopus/Crossref, and Google Search Grounding.
- * Collects lightweight metadata/stubs across all indexed sources and orders them strictly recent to past.
+ * Master Search Service: Retrieves all available studies across PubMed, OpenAlex, DOAJ, Scopus/Crossref, ClinicalTrials.gov, and ISRCTN.
+ * Auto-hydrates linked result publications (PMIDs/DOIs) referenced inside registry trials and deduplicates/merges records.
  */
 export async function searchAllAvailableStudies(query: string, maxFetch = 500, offset = 0): Promise<BulkSearchResult> {
   const qClean = query.trim();
@@ -1427,7 +1652,7 @@ export async function searchAllAvailableStudies(query: string, maxFetch = 500, o
 
   // 2. Normalize comparison words for multi-database search
   const cleanKeywordQuery = qClean.replace(/\s+(?:vs\.?|versus)\s+/gi, ' and ').replace(/[()"]/g, ' ').replace(/\s+/g, ' ').trim();
-  
+
   // Anchor cross-database search query using MetaMapLite expanded clinical terms
   let anchoredCrossDatabaseQuery = cleanKeywordQuery;
   if (metaMapResult?.comparativeDetails) {
@@ -1447,7 +1672,7 @@ export async function searchAllAvailableStudies(query: string, maxFetch = 500, o
     searchOpenAlex(anchoredCrossDatabaseQuery, 100, offset),
     offset === 0 ? fetchLandmarkTrialsFromAPI(anchoredCrossDatabaseQuery, 25) : Promise.resolve([]),
     offset === 0 ? searchGoogleScholarAndWeb(qClean) : Promise.resolve([]),
-    offset === 0 ? searchClinicalTrials(cleanKeywordQuery, 15) : Promise.resolve([])
+    offset === 0 ? searchClinicalTrials({ query: qClean, metaMapResult }, 15) : Promise.resolve([])
   ]);
 
   const val = (idx: number): MedicalDocument[] =>
@@ -1491,14 +1716,72 @@ export async function searchAllAvailableStudies(query: string, maxFetch = 500, o
     console.warn('[searchService] ClinicalTrials.gov NCT enrichment notice:', err instanceof Error ? err.message : err);
   }
 
+  // 4b. Auto-fetch linked result publications (PMIDs / DOIs) cited inside NCT/ISRCTN records if missing from pool
+  try {
+    const existingPmids = new Set(enrichedPool.map(d => d.pmid?.trim()).filter(Boolean) as string[]);
+    const existingDois = new Set(enrichedPool.map(d => sanitizeDoi(d.doi).toLowerCase()).filter(Boolean));
+
+    const missingLinkedPmids = new Set<string>();
+    const missingLinkedDois = new Set<string>();
+
+    for (const doc of enrichedPool) {
+      for (const lp of doc.linkedPmids || []) {
+        const cleanP = String(lp || '').trim();
+        if (/^\d+$/.test(cleanP) && !existingPmids.has(cleanP)) {
+          missingLinkedPmids.add(cleanP);
+        }
+      }
+      for (const ld of doc.linkedDois || []) {
+        const cleanD = sanitizeDoi(ld).toLowerCase();
+        if (cleanD && !existingDois.has(cleanD)) {
+          missingLinkedDois.add(cleanD);
+        }
+      }
+    }
+
+    if (missingLinkedDois.size > 0) {
+      const resolvedFromDoi = await resolveDoisToPmids(Array.from(missingLinkedDois));
+      for (const pmid of resolvedFromDoi) {
+        if (!existingPmids.has(pmid)) {
+          missingLinkedPmids.add(pmid);
+        }
+      }
+    }
+
+    const pmidsToFetch = Array.from(missingLinkedPmids).slice(0, 15);
+    if (pmidsToFetch.length > 0) {
+      const linkedPubMedDocs = await fetchPubMedArticlesByPmids(pmidsToFetch);
+      if (linkedPubMedDocs.length > 0) {
+        enrichedPool = [...enrichedPool, ...linkedPubMedDocs];
+      }
+    }
+  } catch (err) {
+    console.warn('[searchService] Registry linked publication auto-fetch notice:', err instanceof Error ? err.message : err);
+  }
+
   // 5. Cross-source deduplication & PICO/metrics merging (PubMed/journals remain primary; registries supplement PICO)
   const rawPool = deduplicateAndMergeStudies(enrichedPool);
 
-  // Filter out irrelevant papers (dentures, lumbar discectomy, septic shock, etc.) and rank relevant ones
+  // Filter out irrelevant papers & rank primarily by semantic + clinical relevance (384-d cosine)
   const filteredAndRanked = filterAndRankByClinicalRelevance(rawPool, qClean, metaMapResult);
 
-  // If strict filtering returned results, use them; otherwise fallback to deduplicated rawPool
-  const finalPool = filteredAndRanked.length > 0 ? filteredAndRanked.slice(0, maxFetch) : rawPool.slice(0, maxFetch);
+  // If strict filtering returned results, use them; otherwise score rawPool via 384-d cosine similarity (never 0.75 fallback)
+  let finalPool: MedicalDocument[];
+  if (filteredAndRanked.length > 0) {
+    finalPool = filteredAndRanked.slice(0, maxFetch);
+  } else {
+    const { condTerms, intrTerms } = splitClinicalQueryForCtGov(qClean, metaMapResult);
+    finalPool = rawPool
+      .slice(0, maxFetch)
+      .map(d => ({
+        ...d,
+        score:
+          typeof d.score === 'number' && d.score > 0
+            ? d.score
+            : computeCtGovSimilarityScore(d, qClean, condTerms, intrTerms)
+      }))
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
+  }
 
   return {
     allStudies: finalPool,
@@ -1518,6 +1801,8 @@ export const searchService = {
   searchAllAvailableStudies,
   searchMedicalLiterature,
   searchPubMed,
+  fetchPubMedArticlesByPmids,
+  resolveDoisToPmids,
   searchDoaj,
   searchCrossref,
   searchGoogleScholarAndWeb,

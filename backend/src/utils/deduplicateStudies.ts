@@ -114,6 +114,13 @@ function mergePicoData(primary: PicoData, secondary: PicoData): PicoData {
     pValues: mergedPValues,
     hazardRatio: primary?.hazardRatio || secondary?.hazardRatio,
     riskRatio: primary?.riskRatio || secondary?.riskRatio,
+    primaryStatistic:
+      primary?.primaryStatistic ||
+      secondary?.primaryStatistic ||
+      primary?.hazardRatio ||
+      secondary?.hazardRatio ||
+      primary?.riskRatio ||
+      secondary?.riskRatio,
     design: mergedDesign
   };
 }
@@ -196,6 +203,7 @@ function mergeStudyPair(docA: MedicalDocument, docB: MedicalDocument): MedicalDo
     ...primary,
     authors,
     firstAuthor: authors[0] || firstAuthor,
+    year: primary.year ?? secondary.year ?? null,
     doi: sanitizeDoi(primary.doi) || sanitizeDoi(secondary.doi),
     pmid: primary.pmid || secondary.pmid,
     pmcid: primary.pmcid || secondary.pmcid,

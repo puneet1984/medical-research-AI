@@ -29,7 +29,7 @@ interface LinkedPubMedArticle {
   title: string;
   firstAuthor: string;
   journal: string;
-  year: number;
+  year: number | null;
   doi: string;
   webUrl: string;
 }
@@ -92,27 +92,39 @@ export const RightContext: React.FC<RightContextProps> = ({
   onLoadMore
 }) => {
   const [activeTab, setActiveTab] = useState<'sources' | 'pico' | 'vector'>('sources');
-  const [sortOrder, setSortOrder] = useState<'recent' | 'relevance' | 'citations' | 'sample'>('recent');
+  const [sortOrder, setSortOrder] = useState<'recent' | 'relevance' | 'citations' | 'sample'>('relevance');
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [relatedByPmid, setRelatedByPmid] = useState<Record<string, RelatedArticlesState>>({});
 
-  // Sort extracted sources: Recent to Past is the default
+  // Sort extracted sources: Relevance (sim descending) is the default
   const sortedDocuments = useMemo(() => {
     const list = [...documents];
     switch (sortOrder) {
       case 'recent':
-        return list.sort((a, b) => b.year - a.year || (b.score || 0) - (a.score || 0));
+        return list.sort((a, b) => (b.year || 0) - (a.year || 0) || (b.score || 0) - (a.score || 0));
       case 'relevance':
-        return list.sort((a, b) => (b.score || 0) - (a.score || 0));
+        return list.sort((a, b) => {
+          const diff = (b.score || 0) - (a.score || 0);
+          if (Math.abs(diff) > 0.002) return diff;
+          return (b.year || 0) - (a.year || 0);
+        });
       case 'citations':
         return list.sort((a, b) => (b.citationCount || 0) - (a.citationCount || 0));
       case 'sample':
         return list.sort((a, b) => (b.pico?.sampleSize || 0) - (a.pico?.sampleSize || 0));
       default:
-        return list.sort((a, b) => b.year - a.year);
+        return list.sort((a, b) => (b.score || 0) - (a.score || 0) || (b.year || 0) - (a.year || 0));
     }
   }, [documents, sortOrder]);
+
+  const formatPrimaryStat = (pico: MedicalDocument['pico']) => {
+    if (pico.pValues && pico.pValues.length > 0) return pico.pValues[0];
+    if (pico.primaryStatistic) return pico.primaryStatistic;
+    if (pico.hazardRatio) return `HR ${pico.hazardRatio}`;
+    if (pico.riskRatio) return `RR ${pico.riskRatio}`;
+    return 'Not reported';
+  };
 
   const toggleExpand = (id: string) => {
     setExpandedDocIds(prev => {
@@ -133,18 +145,18 @@ export const RightContext: React.FC<RightContextProps> = ({
   const handleCopyCitation = (doc: MedicalDocument) => {
     const authorPart = doc.authors && doc.authors.length > 0 ? `${formatAuthorShort(doc)} ` : '';
     const doiPart = doc.doi ? ` DOI: https://doi.org/${doc.doi}` : '';
-    const citation = `${authorPart}(${doc.year}). ${doc.title}. ${doc.journal}.${doiPart} [${doc.source}]`;
+    const citation = `${authorPart}(${doc.year ?? 'n.d.'}). ${doc.title}. ${doc.journal}.${doiPart} [${doc.source}]`;
     navigator.clipboard.writeText(citation);
     setCopiedId(doc.id);
     setTimeout(() => setCopiedId(null), 2000);
   };
 
   const handleExportCsv = () => {
-    const headers = ['Source Database', 'Study', 'Year', 'Journal', 'Design', 'Sample Size (N)', 'Population', 'Intervention', 'Comparator', 'Primary Outcome', 'Effect Size (HR)', 'p-Values', 'DOI', 'Web URL'];
+    const headers = ['Source Database', 'Study', 'Year', 'Journal', 'Design', 'Sample Size (N)', 'Population', 'Intervention', 'Comparator', 'Primary Outcome', 'Effect Size / Primary Stat', 'p-Values', 'DOI', 'Web URL'];
     const rows = documents.map(d => [
       `"${d.source}"`,
       `"${formatAuthorShort(d).replace(/"/g, '""')}"`,
-      d.year,
+      d.year ?? '"n.d."',
       `"${d.journal.replace(/"/g, '""')}"`,
       `"${d.pico.design}"`,
       d.pico.sampleSize > 0 ? d.pico.sampleSize : '"Not reported"',
@@ -152,9 +164,9 @@ export const RightContext: React.FC<RightContextProps> = ({
       `"${d.pico.intervention.replace(/"/g, '""')}"`,
       `"${d.pico.comparator.replace(/"/g, '""')}"`,
       `"${d.pico.primaryOutcome.replace(/"/g, '""')}"`,
-      `"${d.pico.hazardRatio || ''}"`,
+      `"${(d.pico.primaryStatistic || d.pico.hazardRatio || d.pico.riskRatio || '').replace(/"/g, '""')}"`,
       `"${d.pico.pValues.join('; ')}"`,
-      `"https://doi.org/${d.doi}"`,
+      d.doi ? `"https://doi.org/${d.doi}"` : '""',
       `"${d.webUrl || ''}"`
     ]);
 
@@ -192,7 +204,7 @@ export const RightContext: React.FC<RightContextProps> = ({
         lines.push(`AU  - ${d.firstAuthor}`);
       }
       lines.push(`JO  - ${d.journal}`);
-      lines.push(`PY  - ${d.year}`);
+      if (d.year) lines.push(`PY  - ${d.year}`);
       if (d.doi) lines.push(`DO  - ${d.doi}`);
       if (d.pmid) lines.push(`AN  - PMID:${d.pmid}`);
       if (d.nctId) lines.push(`N1  - ClinicalTrials.gov: ${d.nctId}`);
@@ -213,15 +225,15 @@ export const RightContext: React.FC<RightContextProps> = ({
   const handleExportBibtex = () => {
     const bibRecords = sortedDocuments.map((d, idx) => {
       const authorBase = (d.firstAuthor || d.journal || 'study').replace(/[^a-zA-Z0-9]/g, '').slice(0, 14) || 'study';
-      const citeKey = `${authorBase}${d.year}_${d.pmid || idx + 1}`;
+      const citeKey = `${authorBase}${d.year ?? 'nd'}_${d.pmid || idx + 1}`;
       const authorStr = d.authors && d.authors.length > 0 ? d.authors.join(' and ') : (d.firstAuthor || d.journal);
       const escapeBib = (val: string) => val.replace(/[{}\\]/g, '').replace(/\r?\n/g, ' ').trim();
       const fields: string[] = [
         `  author = {${escapeBib(authorStr)}}`,
         `  title = {{${escapeBib(d.title)}}}`,
-        `  journal = {${escapeBib(d.journal)}}`,
-        `  year = {${d.year}}`
+        `  journal = {${escapeBib(d.journal)}}`
       ];
+      if (d.year) fields.push(`  year = {${d.year}}`);
       if (d.doi) fields.push(`  doi = {${escapeBib(d.doi)}}`);
       if (d.pmid) fields.push(`  pmid = {${d.pmid}}`);
       const url = d.webUrl || (d.doi ? `https://doi.org/${d.doi}` : '');
@@ -396,7 +408,7 @@ export const RightContext: React.FC<RightContextProps> = ({
               </div>
             )}
 
-            {/* Sort Order Selector (Recent to Past is Default) */}
+            {/* Sort Order Selector (Relevance is Default) */}
             {documents.length > 0 && (
               <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-2 border-b border-slate-200 text-xs gap-1.5">
                 <div className="flex items-center gap-1 text-[11px] font-semibold text-slate-500">
@@ -405,8 +417,8 @@ export const RightContext: React.FC<RightContextProps> = ({
                 </div>
                 <div className="flex items-center gap-1 flex-wrap">
                   {[
+                    { id: 'relevance', label: 'Relevance (sim ↓)' },
                     { id: 'recent', label: 'Recent to Past (Year ↓)' },
-                    { id: 'relevance', label: 'Relevance' },
                     { id: 'citations', label: 'Citations' },
                     { id: 'sample', label: 'Sample (N)' }
                   ].map(item => (
@@ -469,10 +481,10 @@ export const RightContext: React.FC<RightContextProps> = ({
                           {doc.source}
                         </span>
 
-                        {/* Year Badge Prominent (Recent to Past) */}
+                        {/* Year Badge */}
                         <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-slate-800 text-white flex items-center gap-1 shadow-2xs">
                           <Calendar className="w-3 h-3 text-teal-400" />
-                          <span>{doc.year}</span>
+                          <span>{doc.year ?? 'Year n.d.'}</span>
                         </span>
 
                         <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
@@ -486,6 +498,8 @@ export const RightContext: React.FC<RightContextProps> = ({
                             ? 'bg-rose-50 text-rose-700 border border-rose-200'
                             : doc.pico.design === 'Consensus / Classification Paper'
                             ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                            : doc.pico.design === 'Review Article'
+                            ? 'bg-sky-50 text-sky-700 border border-sky-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                         }`}>
                           {doc.pico.design}
@@ -586,9 +600,9 @@ export const RightContext: React.FC<RightContextProps> = ({
                         </span>
                       </div>
                       <div className="bg-slate-50 rounded p-1.5 border border-slate-100">
-                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Primary p-Value:</span>
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Primary Stat / p-Value:</span>
                         <span className="font-mono font-semibold text-teal-700">
-                          {doc.pico.pValues[0] || 'Not reported'}
+                          {formatPrimaryStat(doc.pico)}
                         </span>
                       </div>
                     </div>
@@ -601,8 +615,14 @@ export const RightContext: React.FC<RightContextProps> = ({
                           <p><strong className="text-teal-900">Intervention:</strong> {doc.pico.intervention}</p>
                           <p><strong className="text-teal-900">Comparator:</strong> {doc.pico.comparator}</p>
                           <p><strong className="text-teal-900">Outcome:</strong> {doc.pico.primaryOutcome}</p>
+                          {doc.pico.primaryStatistic && doc.pico.primaryStatistic !== doc.pico.hazardRatio && (
+                            <p><strong className="text-teal-900">Primary Effect Estimate:</strong> <span className="font-mono font-semibold">{doc.pico.primaryStatistic}</span></p>
+                          )}
                           {doc.pico.hazardRatio && (
                             <p><strong className="text-teal-900">Hazard Ratio:</strong> <span className="font-mono font-semibold">{doc.pico.hazardRatio}</span></p>
+                          )}
+                          {doc.pico.riskRatio && (
+                            <p><strong className="text-teal-900">Risk Ratio:</strong> <span className="font-mono font-semibold">{doc.pico.riskRatio}</span></p>
                           )}
                         </div>
 
@@ -761,7 +781,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                                           {art.title}
                                         </a>
                                         <div className="text-[10px] text-slate-500">
-                                          {art.firstAuthor} ({art.year}) • {art.journal}
+                                          {art.firstAuthor} ({art.year ?? 'n.d.'}) • {art.journal}
                                         </div>
                                       </div>
                                       <span className="font-mono text-[9px] text-blue-700 bg-blue-50 px-1 py-0.5 rounded shrink-0">
@@ -791,7 +811,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                                           {art.title}
                                         </a>
                                         <div className="text-[10px] text-slate-500">
-                                          {art.firstAuthor} ({art.year}) • {art.journal}
+                                          {art.firstAuthor} ({art.year ?? 'n.d.'}) • {art.journal}
                                         </div>
                                       </div>
                                       <span className="font-mono text-[9px] text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded shrink-0">
@@ -940,7 +960,7 @@ export const RightContext: React.FC<RightContextProps> = ({
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
                         <div className="font-semibold text-slate-900">{doc.firstAuthor || doc.journal}</div>
-                        <div className="text-[10px] text-slate-500">{doc.year} • {doc.journal.slice(0, 16)}...</div>
+                        <div className="text-[10px] text-slate-500">{doc.year ?? 'n.d.'} • {doc.journal.slice(0, 16)}...</div>
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
                         <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
@@ -954,6 +974,8 @@ export const RightContext: React.FC<RightContextProps> = ({
                             ? 'bg-rose-50 text-rose-700 border border-rose-200'
                             : doc.pico.design === 'Consensus / Classification Paper'
                             ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                            : doc.pico.design === 'Review Article'
+                            ? 'bg-sky-50 text-sky-700 border border-sky-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                         }`}>
                           {doc.pico.design === 'Randomized Controlled Trial' ? 'RCT' : doc.pico.design}
@@ -981,8 +1003,18 @@ export const RightContext: React.FC<RightContextProps> = ({
                             HR: <span className="font-semibold">{doc.pico.hazardRatio}</span>
                           </div>
                         )}
+                        {doc.pico.riskRatio && (
+                          <div className="font-mono text-[10px] text-slate-700">
+                            RR: <span className="font-semibold">{doc.pico.riskRatio}</span>
+                          </div>
+                        )}
+                        {doc.pico.primaryStatistic && doc.pico.primaryStatistic !== doc.pico.hazardRatio && (
+                          <div className="font-mono text-[10px] text-indigo-800 mb-0.5 max-w-[180px] truncate" title={doc.pico.primaryStatistic}>
+                            {doc.pico.primaryStatistic}
+                          </div>
+                        )}
                         <span className="font-mono text-[10px] text-teal-800 bg-teal-50 px-1 py-0.5 rounded font-semibold border border-teal-200">
-                          {doc.pico.pValues[0] || 'Not reported'}
+                          {doc.pico.pValues[0] || (doc.pico.primaryStatistic ? 'p-value: Not reported' : 'Not reported')}
                         </span>
                       </td>
                     </tr>
@@ -1183,19 +1215,19 @@ export const RightContext: React.FC<RightContextProps> = ({
               </div>
 
               <div className="space-y-2">
-                {documents.slice(0, 15).map((doc) => {
-                  const score = doc.score ?? 0.85;
-                  const pct = Math.round(score * 100);
+                {sortedDocuments.slice(0, 15).map((doc) => {
+                  const hasScore = typeof doc.score === 'number';
+                  const pct = hasScore ? Math.round((doc.score as number) * 100) : 0;
                   return (
                     <div key={doc.id} className="space-y-1">
                       <div className="flex justify-between text-[11px]">
-                        <span className="font-medium text-slate-700 truncate max-w-xs">{doc.firstAuthor} et al. ({doc.year}) [{doc.source}]</span>
-                        <span className="font-mono font-semibold text-teal-700">{pct}%</span>
+                        <span className="font-medium text-slate-700 truncate max-w-xs">{doc.firstAuthor} et al. ({doc.year ?? 'n.d.'}) [{doc.source}]</span>
+                        <span className="font-mono font-semibold text-teal-700">{hasScore ? `${pct}%` : 'N/A'}</span>
                       </div>
                       <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
                         <div
                           className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 rounded-full transition-all duration-500"
-                          style={{ width: `${Math.max(10, Math.min(100, pct))}%` }}
+                          style={{ width: `${hasScore ? Math.max(4, Math.min(100, pct)) : 0}%` }}
                         />
                       </div>
                     </div>

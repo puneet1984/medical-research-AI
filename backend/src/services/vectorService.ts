@@ -9,6 +9,7 @@ import {
   getActiveEmbeddingInfo,
   setEmbeddingDimension
 } from './embeddingService.js';
+import { parseValidPublicationYear, formatPublicationYear } from './corpusContextBuilder.js';
 
 export const COLLECTION_NAME = 'medical_workspace';
 
@@ -463,7 +464,8 @@ export function chunkDocumentForEmbedding(
   overlap = 200,
   maxChunks = 12
 ): string[] {
-  const headerAnchor = `${doc.title} (${doc.journal}, ${doc.year}). Intervention: ${doc.pico?.intervention || ''}. Population: ${doc.pico?.population || ''}. Outcome: ${doc.pico?.primaryOutcome || ''}.`;
+  const yearLabel = formatPublicationYear(doc.year);
+  const headerAnchor = `${doc.title} (${doc.journal}, ${yearLabel}). Intervention: ${doc.pico?.intervention || ''}. Population: ${doc.pico?.population || ''}. Outcome: ${doc.pico?.primaryOutcome || ''}.`;
 
   if (!doc.hasFullText || !doc.fullText || doc.fullText.trim().length < 120) {
     return [`${headerAnchor} ${doc.abstract || ''}`.trim()];
@@ -486,7 +488,7 @@ export function chunkDocumentForEmbedding(
 
     const passage = normalizedBody.slice(cursor, end).trim();
     if (passage.length > 0) {
-      const prefix = chunks.length === 0 ? `${headerAnchor} ${doc.abstract || ''}\n\n` : `${doc.title} (${doc.year}):\n`;
+      const prefix = chunks.length === 0 ? `${headerAnchor} ${doc.abstract || ''}\n\n` : `${doc.title} (${yearLabel}):\n`;
       chunks.push(`${prefix}${passage}`.trim());
     }
 
@@ -696,6 +698,9 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
           const p = (hit.payload || {}) as any;
           const dedupKey = String(p.docKey || p.docId || p.doi || p.pmid || hit.id).toLowerCase().trim();
           const existing = deduped.get(dedupKey);
+          const rawAbstract = String(p.abstract || '').trim();
+          const hasMeaningfulAbs = Boolean((rawAbstract.length >= 25 && !/^abstract not reported/i.test(rawAbstract)) || p.hasFullText);
+          const adjustedScore = hasMeaningfulAbs ? hit.score : Math.round(hit.score * 0.65 * 10000) / 10000;
 
           const doc: MedicalDocument = {
             id: p.docId || String(hit.id),
@@ -703,7 +708,7 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
             authors: p.authors || [],
             firstAuthor: p.firstAuthor || (p.authors && p.authors[0]) || 'Author',
             journal: p.journal || 'Journal',
-            year: p.year || 2023,
+            year: parseValidPublicationYear(p.year),
             doi: p.doi || '',
             pmid: p.pmid,
             pmcid: p.pmcid,
@@ -724,15 +729,15 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
               pValues: [],
               design: 'Randomized Controlled Trial'
             },
-            score: hit.score
+            score: adjustedScore
           };
 
           if (!existing) {
-            deduped.set(dedupKey, { document: doc, score: hit.score });
+            deduped.set(dedupKey, { document: doc, score: adjustedScore });
           } else {
-            if (hit.score > existing.score) {
-              existing.score = hit.score;
-              existing.document.score = hit.score;
+            if (adjustedScore > existing.score) {
+              existing.score = adjustedScore;
+              existing.document.score = adjustedScore;
             }
             if (!existing.document.fullText && doc.fullText) {
               existing.document.fullText = doc.fullText;
@@ -758,12 +763,15 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
   // Local in-memory cosine ranking fallback (deduplicating chunks per document)
   const dedupedMemory = new Map<string, VectorSearchResult>();
   for (const point of memoryStore.values()) {
-    const score = cosineSimilarity(queryVector, point.vector);
+    const rawScore = Math.max(0, cosineSimilarity(queryVector, point.vector));
+    const rawAbs = (point.payload.abstract || '').trim();
+    const hasMeaningfulAbs = Boolean((rawAbs.length >= 25 && !/^abstract not reported/i.test(rawAbs)) || point.payload.hasFullText);
+    const score = hasMeaningfulAbs ? rawScore : Math.round(rawScore * 0.65 * 10000) / 10000;
     const dedupKey = point.docKey || (point.payload.doi || point.payload.pmid || point.payload.id).toLowerCase().trim();
     const existing = dedupedMemory.get(dedupKey);
     if (!existing || score > existing.score) {
       dedupedMemory.set(dedupKey, {
-        document: { ...point.payload, score },
+        document: { ...point.payload, year: parseValidPublicationYear(point.payload.year), score },
         score
       });
     }

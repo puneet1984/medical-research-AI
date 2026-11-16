@@ -7,7 +7,8 @@ export interface PicoData {
   pValues: string[];
   hazardRatio?: string;
   riskRatio?: string;
-  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series' | 'Preclinical / Experimental Study' | 'Consensus / Classification Paper' | 'Observational / Descriptive Study';
+  primaryStatistic?: string;
+  design: 'Randomized Controlled Trial' | 'Meta-Analysis' | 'Systematic Review' | 'Review Article' | 'Cohort Study' | 'Clinical Trial' | 'Case Report' | 'Case Series' | 'Preclinical / Experimental Study' | 'Consensus / Classification Paper' | 'Observational / Descriptive Study';
 }
 
 export interface FullTextSections {
@@ -36,7 +37,7 @@ export interface MedicalDocument {
   authors: string[];
   firstAuthor: string;
   journal: string;
-  year: number;
+  year: number | null;
   doi: string;
   pmid?: string;
   pmcid?: string;

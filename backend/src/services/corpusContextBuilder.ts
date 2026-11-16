@@ -29,12 +29,37 @@ export const STUDY_DESIGN_PLURAL_MAP: Record<string, string> = {
   'Meta-Analysis': 'Meta-Analyses',
   'Case Report': 'Case Reports',
   'Systematic Review': 'Systematic Reviews',
+  'Review Article': 'Review Articles',
   'Randomized Controlled Trial': 'Randomized Controlled Trials',
   'Clinical Trial': 'Clinical Trials',
   'Preclinical / Experimental Study': 'Preclinical / Experimental Studies',
   'Consensus / Classification Paper': 'Consensus / Classification Papers',
   'Observational / Descriptive Study': 'Observational / Descriptive Studies'
 };
+
+/**
+ * Validates that a publication year is an authentic 4-digit year between 1950 and the current calendar year.
+ * Returns null instead of defaulting missing/invalid years to the current year.
+ */
+export function parseValidPublicationYear(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const currentYear = new Date().getFullYear();
+  if (typeof raw === 'number') {
+    const yr = Math.trunc(raw);
+    return yr >= 1950 && yr <= currentYear ? yr : null;
+  }
+  const matches = String(raw).match(/\b(19[5-9]\d|20\d{2})\b/g);
+  if (!matches || matches.length === 0) return null;
+  for (const m of matches) {
+    const yr = parseInt(m, 10);
+    if (yr >= 1950 && yr <= currentYear) return yr;
+  }
+  return null;
+}
+
+export function formatPublicationYear(year?: number | null): string {
+  return typeof year === 'number' && year >= 1950 ? String(year) : 'Year n.d.';
+}
 
 export function pluralizeStudyDesign(design: string, count: number): string {
   const cleanDesign = (design || 'Observational / Descriptive Study').trim();
@@ -240,6 +265,7 @@ export function computePicoCompletenessScore(doc: MedicalDocument): number {
   const hasStats =
     Boolean(pico.hazardRatio && pico.hazardRatio !== 'Not reported') ||
     Boolean(pico.riskRatio && pico.riskRatio !== 'Not reported') ||
+    Boolean(pico.primaryStatistic && pico.primaryStatistic !== 'Not reported') ||
     (Array.isArray(pico.pValues) && pico.pValues.length > 0);
   if (hasStats) {
     score += 3;
@@ -458,13 +484,19 @@ function stemToken(token: string): string {
   return token;
 }
 
+function stripConferencePosterCodes(textLower: string): string {
+  return textLower.replace(/\b[a-z]{2,5}-\d{2,6}\b/g, ' ');
+}
+
 function tokenMatchesText(token: string, textLower: string): boolean {
+  const cleanText = stripConferencePosterCodes(textLower);
   const stemmed = stemToken(token);
-  if (token.length <= 3) {
+  if (token.length <= 4) {
     const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${escaped}\\b`, 'i').test(textLower);
+    // Require strict word boundaries and exclude hyphenated poster/abstract codes (e.g. FRI-247)
+    return new RegExp(`(^|[^a-z0-9-])${escaped}(?![a-z0-9-]|-?\\d)`, 'i').test(cleanText);
   }
-  return textLower.includes(token) || (stemmed.length >= 4 && textLower.includes(stemmed));
+  return cleanText.includes(token) || (stemmed.length >= 4 && cleanText.includes(stemmed));
 }
 
 export function extractQueryRelevanceProfile(researchQuestion: string): {
@@ -539,24 +571,31 @@ export function rankAndFilterStudiesForQuestion(
 
   const evaluated: ScoredEntry[] = sanitizedStudies.map((doc) => {
     const titleLower = (doc.title || '').toLowerCase();
+    const rawAbs = (doc.abstract || '').trim();
+    const hasMeaningfulAbstract =
+      rawAbs.length >= 25 &&
+      !/^abstract not reported in source metadata\.?$/i.test(rawAbs) &&
+      !/^not reported in the retrieved studies\.?$/i.test(rawAbs);
+
     const abstractAndPicoLower = [
-      doc.abstract || '',
-      doc.pico?.population || '',
-      doc.pico?.intervention || '',
-      doc.pico?.comparator || '',
-      doc.pico?.primaryOutcome || '',
+      hasMeaningfulAbstract ? rawAbs : '',
+      doc.pico?.population && doc.pico.population !== 'Not reported' ? doc.pico.population : '',
+      doc.pico?.intervention && doc.pico.intervention !== 'Not reported' ? doc.pico.intervention : '',
+      doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : '',
+      doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : '',
       doc.fullTextSections?.methods || '',
       doc.fullTextSections?.results || ''
     ].join(' ').toLowerCase();
     const fullLower = `${titleLower} ${abstractAndPicoLower}`;
 
-    const docVector = generateLocalEmbedding(
-      `${doc.title} ${doc.abstract || ''} ${doc.pico?.population || ''} ${doc.pico?.intervention || ''} ${doc.pico?.primaryOutcome || ''}`.slice(0, 3000),
-      384
-    );
-    const localCosine = Math.max(0, cosineSimilarity(queryVector, docVector));
+    const embedText = hasMeaningfulAbstract || doc.hasFullText
+      ? `${doc.title} ${rawAbs} ${doc.fullText ? doc.fullText.slice(0, 3000) : ''}`.slice(0, 3500)
+      : doc.title;
+    const docVector = generateLocalEmbedding(embedText, 384);
+    const rawCosine = Math.max(0, cosineSimilarity(queryVector, docVector));
+    const localCosine = hasMeaningfulAbstract || doc.hasFullText ? rawCosine : rawCosine * 0.65;
     const priorScore = typeof doc.score === 'number' && doc.score > 0 && doc.score <= 1 ? doc.score : localCosine;
-    const cosine = localCosine * 0.65 + priorScore * 0.35;
+    const cosine = localCosine * 0.70 + priorScore * 0.30;
 
     let specificHits = 0;
     let titleSpecificHits = 0;
@@ -578,7 +617,7 @@ export function rankAndFilterStudiesForQuestion(
 
     let phraseHits = 0;
     for (const phrase of specificPhrases) {
-      if (fullLower.includes(phrase)) {
+      if (stripConferencePosterCodes(fullLower).includes(phrase)) {
         phraseHits++;
       }
     }
@@ -588,17 +627,21 @@ export function rankAndFilterStudiesForQuestion(
     const phraseRatio = specificPhrases.length > 0 ? phraseHits / specificPhrases.length : 0;
     const fullTextBonus = doc.hasFullText ? 0.03 : 0;
 
-    const combinedScore =
+    let combinedScore =
       cosine * 0.42 +
       specificRatio * 0.38 +
       titleRatio * 0.12 +
       phraseRatio * 0.08 +
       fullTextBonus;
 
+    if (!hasMeaningfulAbstract && !doc.hasFullText) {
+      combinedScore = combinedScore * 0.65;
+    }
+
     return {
       doc: {
         ...doc,
-        score: Number(Math.min(0.99, Math.max(0.05, combinedScore)).toFixed(4))
+        score: Number(Math.min(0.99, Math.max(0.01, combinedScore)).toFixed(4))
       },
       combinedScore,
       cosine,
@@ -637,10 +680,10 @@ export function rankAndFilterStudiesForQuestion(
   }
 
   filtered.sort((a, b) => {
-    if (Math.abs(b.combinedScore - a.combinedScore) > 0.025) {
+    if (Math.abs(b.combinedScore - a.combinedScore) > 0.005) {
       return b.combinedScore - a.combinedScore;
     }
-    if (b.doc.year !== a.doc.year) return b.doc.year - a.doc.year;
+    if ((b.doc.year || 0) !== (a.doc.year || 0)) return (b.doc.year || 0) - (a.doc.year || 0);
     return (b.doc.citationCount || 0) - (a.doc.citationCount || 0);
   });
 
@@ -747,19 +790,20 @@ export function buildRetrievalStats(
 export function formatCanonicalCitation(doc: MedicalDocument): string {
   const cleanDoi = sanitizeDoi(doc.doi);
   const idPart = doc.pmid ? `PMID:${doc.pmid}` : (cleanDoi || doc.id);
+  const yearLabel = typeof doc.year === 'number' && doc.year >= 1950 ? String(doc.year) : 'n.d.';
   const validAuthors = sanitizeAuthorsList(doc.authors);
   const candidateFirst = validAuthors[0] || (!isPlaceholderAuthor(doc.firstAuthor) ? decodeHtmlEntities(doc.firstAuthor) : '');
 
   if (candidateFirst) {
     const authorSurname = candidateFirst.split(/\s+/)[0] || candidateFirst;
-    return `[${authorSurname}, ${doc.year} (${idPart})]`;
+    return `[${authorSurname}, ${yearLabel} (${idPart})]`;
   }
 
   const cleanJournal = sanitizeJournalField(doc.journal);
   if (cleanJournal && cleanJournal !== 'Biomedical Journal' && cleanJournal !== 'Medical Journal') {
-    return `[${cleanJournal}, ${doc.year} (${idPart})]`;
+    return `[${cleanJournal}, ${yearLabel} (${idPart})]`;
   }
-  return `[${doc.year} (${idPart})]`;
+  return `[${yearLabel} (${idPart})]`;
 }
 
 /**
@@ -783,7 +827,7 @@ export function buildCorpusContext(
       authors: validAuthors.slice(0, 6),
       title: doc.title,
       journal: doc.journal,
-      year: doc.year,
+      year: typeof doc.year === 'number' && doc.year >= 1950 ? doc.year : 'Year n.d.',
       pmid: doc.pmid || null,
       pmcid: doc.pmcid || null,
       nctId: doc.nctId || null,
@@ -802,6 +846,7 @@ export function buildCorpusContext(
       intervention: doc.pico?.intervention && doc.pico.intervention !== 'Not reported' ? doc.pico.intervention : 'Not reported',
       comparator: doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : 'Not reported',
       primaryOutcome: doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : 'Not reported',
+      primaryStatistic: doc.pico?.primaryStatistic || 'Not reported',
       hazardRatio: doc.pico?.hazardRatio || 'Not reported',
       riskRatio: doc.pico?.riskRatio || 'Not reported',
       pValues: Array.isArray(doc.pico?.pValues) && doc.pico.pValues.length > 0
@@ -823,12 +868,13 @@ export function buildCorpusContext(
     const mergedLabel = doc.mergedSources && doc.mergedSources.length > 1
       ? ` (Merged from: ${doc.mergedSources.join(', ')})`
       : '';
+    const yearDisplay = formatPublicationYear(doc.year);
     const lines: string[] = [
       `[SOURCE ${idx + 1}] ${citationKey}`,
       `Authors: ${authorDisplay}`,
       `Title: ${doc.title}`,
-      `Journal: ${doc.journal} (${doc.year}) | Source DB: ${doc.source}${mergedLabel} | PMID: ${doc.pmid || 'N/A'} | PMCID: ${doc.pmcid || 'N/A'} | DOI: ${doc.doi || 'N/A'}${registryIds ? ` | ${registryIds}` : ''}`,
-      `Study Design: ${doc.pico?.design || 'Observational / Descriptive Study'} | Sample Size N: ${doc.pico?.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'}`,
+      `Journal: ${doc.journal} (${yearDisplay}) | Source DB: ${doc.source}${mergedLabel} | PMID: ${doc.pmid || 'N/A'} | PMCID: ${doc.pmcid || 'N/A'} | DOI: ${doc.doi || 'N/A'}${registryIds ? ` | ${registryIds}` : ''}`,
+      `Study Design: ${doc.pico?.design || 'Observational / Descriptive Study'} | Sample Size N: ${doc.pico?.sampleSize > 0 ? doc.pico.sampleSize : 'Not reported'} | Primary Statistic: ${doc.pico?.primaryStatistic || doc.pico?.pValues?.[0] || 'Not reported'}`,
       `AbstractText: ${doc.abstract || 'Not reported in the retrieved studies'}`
     ];
 

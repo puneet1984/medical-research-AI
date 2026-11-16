@@ -13,7 +13,8 @@ import {
   rankAndFilterStudiesForQuestion,
   buildRetrievalStats,
   buildCorpusContext,
-  formatCanonicalCitation
+  formatCanonicalCitation,
+  formatPublicationYear
 } from './corpusContextBuilder.js';
 
 export type { RetrievalStatsMetadata };
@@ -189,10 +190,11 @@ function formatStudyActorLabel(doc: MedicalDocument, includeDesign = false): str
     : (doc.journal && doc.journal !== 'Biomedical Journal' && doc.journal !== 'Medical Journal'
         ? doc.journal
         : 'Retrieved Study');
+  const yearLabel = formatPublicationYear(doc.year);
   if (includeDesign) {
-    return `${actor} (${doc.year}, ${doc.pico?.design || 'Observational / Descriptive Study'})`;
+    return `${actor} (${yearLabel}, ${doc.pico?.design || 'Observational / Descriptive Study'})`;
   }
-  return `${actor} (${doc.year})`;
+  return `${actor} (${yearLabel})`;
 }
 
 /**
@@ -210,6 +212,7 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
 
   const cleanTitle = doc.title.replace(/\.+$/, '');
   const cleanJournal = doc.journal.replace(/\.+$/, '');
+  const yearLabel = formatPublicationYear(doc.year);
   const pmidSegment = doc.pmid ? ` PMID: ${doc.pmid}.` : '';
   const pmcidSegment = doc.pmcid ? ` PMCID: ${doc.pmcid}.` : '';
   const doiUrl = doc.doi ? `https://doi.org/${doc.doi}` : '';
@@ -218,7 +221,7 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
   if (citationStyle === 'APA') {
     const parts = authorList
       ? [
-          `${authorList} (${doc.year}).`,
+          `${authorList} (${yearLabel}).`,
           `${cleanTitle}.`,
           `*${cleanJournal}*.`,
           doiUrl,
@@ -227,7 +230,7 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
         ]
       : [
           `${cleanTitle}.`,
-          `(${doc.year}).`,
+          `(${yearLabel}).`,
           `*${cleanJournal}*.`,
           doiUrl,
           pmidSegment.trim(),
@@ -240,14 +243,14 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
       ? [
           `${indexOneBased}. ${authorList}.`,
           `"${cleanTitle}."`,
-          `*${cleanJournal}* (${doc.year}).`,
+          `*${cleanJournal}* (${yearLabel}).`,
           doiText,
           pmidSegment.trim(),
           pmcidSegment.trim()
         ]
       : [
           `${indexOneBased}. "${cleanTitle}."`,
-          `*${cleanJournal}* (${doc.year}).`,
+          `*${cleanJournal}* (${yearLabel}).`,
           doiText,
           pmidSegment.trim(),
           pmcidSegment.trim()
@@ -259,13 +262,13 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
       ? [
           `${authorList}.`,
           `"${cleanTitle}."`,
-          `*${cleanJournal}*, ${doc.year}${doiUrl ? `, ${doiUrl}` : ''}.`,
+          `*${cleanJournal}*, ${yearLabel}${doiUrl ? `, ${doiUrl}` : ''}.`,
           pmidSegment.trim(),
           pmcidSegment.trim()
         ]
       : [
           `"${cleanTitle}."`,
-          `*${cleanJournal}*, ${doc.year}${doiUrl ? `, ${doiUrl}` : ''}.`,
+          `*${cleanJournal}*, ${yearLabel}${doiUrl ? `, ${doiUrl}` : ''}.`,
           pmidSegment.trim(),
           pmcidSegment.trim()
         ];
@@ -277,7 +280,7 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
         `${indexOneBased}. ${authorList}.`,
         `${cleanTitle}.`,
         `${cleanJournal}.`,
-        `${doc.year};`,
+        `${yearLabel};`,
         doiText,
         pmidSegment.trim(),
         pmcidSegment.trim()
@@ -285,7 +288,7 @@ function formatVerifiedReference(rawDoc: MedicalDocument, citationStyle: string,
     : [
         `${indexOneBased}. ${cleanTitle}.`,
         `${cleanJournal}.`,
-        `${doc.year};`,
+        `${yearLabel};`,
         doiText,
         pmidSegment.trim(),
         pmcidSegment.trim()
@@ -1008,9 +1011,10 @@ function buildGroundedFallbackSectionAction(
       const cit = formatCanonicalCitation(doc);
       const nText = doc.pico?.sampleSize > 0 ? `N = ${doc.pico.sampleSize}` : 'sample size Not reported in the retrieved studies';
       const pText = doc.pico?.pValues?.length ? doc.pico.pValues.join(', ') : 'p-value Not reported in the retrieved studies';
+      const statText = doc.pico?.primaryStatistic ? `, ${doc.pico.primaryStatistic}` : '';
       const hrText = doc.pico?.hazardRatio ? `, HR ${doc.pico.hazardRatio}` : '';
       const rrText = doc.pico?.riskRatio ? `, RR ${doc.pico.riskRatio}` : '';
-      return `In ${formatStudyActorLabel(doc, true)}, ${nText} evaluating ${doc.pico?.intervention || 'the intervention'} versus ${doc.pico?.comparator || 'comparator'} reported ${doc.pico?.primaryOutcome || 'primary outcomes'} (${pText}${hrText}${rrText}) ${cit}.`;
+      return `In ${formatStudyActorLabel(doc, true)}, ${nText} evaluating ${doc.pico?.intervention || 'the intervention'} versus ${doc.pico?.comparator || 'comparator'} reported ${doc.pico?.primaryOutcome || 'primary outcomes'} (${pText}${statText}${hrText}${rrText}) ${cit}.`;
     }).join(' ');
     return `${sectionContent}\n\n${groundedAdditions}`;
   }
@@ -1071,6 +1075,7 @@ function createRuleBasedDraft(
   const studyEvidenceParagraphs = metricsStudies.map((d) => {
     const cit = formatCanonicalCitation(d);
     const nVal = d.pico?.sampleSize > 0 ? `N = ${d.pico.sampleSize}` : 'N = Not reported';
+    const statVal = d.pico?.primaryStatistic ? `Primary Stat: ${d.pico.primaryStatistic}; ` : '';
     const hrVal = d.pico?.hazardRatio ? `HR ${d.pico.hazardRatio}` : 'HR: Not reported';
     const rrVal = d.pico?.riskRatio ? `RR ${d.pico.riskRatio}` : 'RR: Not reported';
     const pVal = d.pico?.pValues?.length ? d.pico.pValues.join(', ') : 'p-value: Not reported';
@@ -1078,7 +1083,7 @@ function createRuleBasedDraft(
     const intText = d.pico?.intervention && d.pico.intervention !== 'Not reported' ? d.pico.intervention : 'evaluated intervention (regimen details not reported)';
     const compText = d.pico?.comparator && d.pico.comparator !== 'Not reported' ? d.pico.comparator : 'comparator arm (not reported)';
     const outText = d.pico?.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'clinical outcomes (not reported)';
-    return `- **${formatStudyActorLabel(d, true)}** evaluated ${popText} (${nVal}), comparing ${intText} against ${compText}, with primary outcome ${outText} (${hrVal}; ${rrVal}; ${pVal}) ${cit}.`;
+    return `- **${formatStudyActorLabel(d, true)}** evaluated ${popText} (${nVal}), comparing ${intText} against ${compText}, with primary outcome ${outText} (${statVal}${hrVal}; ${rrVal}; ${pVal}) ${cit}.`;
   }).join('\n');
 
   const leadStudy = metricsStudies[0] || sanitizedEvidence[0];

@@ -218,7 +218,7 @@ export default function App() {
         return false;
       }
       // 3. Publication Year
-      if (filters.yearFrom > 0 && doc.year < filters.yearFrom) {
+      if (filters.yearFrom > 0 && (typeof doc.year !== 'number' || doc.year < filters.yearFrom)) {
         return false;
       }
       // 4. Statistical significance (p < 0.05)
