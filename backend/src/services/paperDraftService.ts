@@ -1075,15 +1075,25 @@ function createRuleBasedDraft(
   const studyEvidenceParagraphs = metricsStudies.map((d) => {
     const cit = formatCanonicalCitation(d);
     const nVal = d.pico?.sampleSize > 0 ? `N = ${d.pico.sampleSize}` : 'N = Not reported';
-    const statVal = d.pico?.primaryStatistic ? `Primary Stat: ${d.pico.primaryStatistic}; ` : '';
-    const hrVal = d.pico?.hazardRatio ? `HR ${d.pico.hazardRatio}` : 'HR: Not reported';
-    const rrVal = d.pico?.riskRatio ? `RR ${d.pico.riskRatio}` : 'RR: Not reported';
+    const metricType = d.pico?.effectMetricType;
+    const metricEst = d.pico?.effectEstimate;
+    let effectText = 'Effect Estimate: Not reported';
+    if (metricType && metricEst) {
+      effectText = `${metricType} ${metricEst}`;
+    } else if (d.pico?.hazardRatio) {
+      effectText = `HR ${d.pico.hazardRatio}`;
+    } else if (d.pico?.riskRatio) {
+      effectText = /^OR\b/i.test(d.pico.riskRatio) ? d.pico.riskRatio : `RR ${d.pico.riskRatio}`;
+    } else if (d.pico?.primaryStatistic) {
+      effectText = d.pico.primaryStatistic;
+    }
     const pVal = d.pico?.pValues?.length ? d.pico.pValues.join(', ') : 'p-value: Not reported';
+    const statSummary = effectText === pVal ? effectText : `${effectText}; ${pVal}`;
     const popText = d.pico?.population && d.pico.population !== 'Not reported' ? d.pico.population : 'study participants (eligibility criteria not reported)';
     const intText = d.pico?.intervention && d.pico.intervention !== 'Not reported' ? d.pico.intervention : 'evaluated intervention (regimen details not reported)';
     const compText = d.pico?.comparator && d.pico.comparator !== 'Not reported' ? d.pico.comparator : 'comparator arm (not reported)';
     const outText = d.pico?.primaryOutcome && d.pico.primaryOutcome !== 'Not reported' ? d.pico.primaryOutcome : 'clinical outcomes (not reported)';
-    return `- **${formatStudyActorLabel(d, true)}** evaluated ${popText} (${nVal}), comparing ${intText} against ${compText}, with primary outcome ${outText} (${statVal}${hrVal}; ${rrVal}; ${pVal}) ${cit}.`;
+    return `- **${formatStudyActorLabel(d, true)}** evaluated ${popText} (${nVal}), comparing ${intText} against ${compText}, with primary outcome ${outText} (${statSummary}) ${cit}.`;
   }).join('\n');
 
   const leadStudy = metricsStudies[0] || sanitizedEvidence[0];

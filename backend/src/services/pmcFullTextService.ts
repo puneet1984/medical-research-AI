@@ -238,6 +238,10 @@ export function parsePmcArticleXml(articleXml: string, maxCharsPerArticle = 1400
       continue;
     }
 
+    if (/\b(introduction|background)\b/i.test(hint) && !/\b(method|methods|methodology|material|materials|study\s*design|protocol)\b/i.test(hint)) {
+      continue;
+    }
+
     if (/\b(method|methods|methodology|material|materials|patient|patients|subject|subjects|participant|participants|study\s*design|protocol|surgical|operative|statistical)\b/i.test(hint)) {
       methodsParts.push(cleanText);
     } else if (/\b(result|results|finding|findings|outcome|outcomes)\b/i.test(hint)) {

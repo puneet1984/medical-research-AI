@@ -118,11 +118,69 @@ export const RightContext: React.FC<RightContextProps> = ({
     }
   }, [documents, sortOrder]);
 
+  const resolveEffectMetricDisplay = (pico: MedicalDocument['pico']) => {
+    const stripPrefix = (val: string, prefixRe: RegExp) => val.replace(prefixRe, '').trim();
+
+    if (pico.effectMetricType && pico.effectEstimate) {
+      const value = stripPrefix(
+        pico.effectEstimate,
+        /^(?:a?(?:HR|OR|RR)|WMD|SMD|MD|Odds\s+Ratio|Hazard\s+Ratio|Risk\s+Ratio|Relative\s+Risk|Mean\s+Difference)\s*[:=]?\s*/i
+      );
+      switch (pico.effectMetricType) {
+        case 'OR':
+          return { fullLabel: 'Odds Ratio', shortLabel: 'OR', value, combined: `OR ${value}` };
+        case 'HR':
+          return { fullLabel: 'Hazard Ratio', shortLabel: 'HR', value, combined: `HR ${value}` };
+        case 'RR':
+          return { fullLabel: 'Risk Ratio', shortLabel: 'RR', value, combined: `RR ${value}` };
+        case 'MD':
+          return { fullLabel: 'Mean Difference', shortLabel: 'MD', value, combined: `MD ${value}` };
+      }
+    }
+
+    if (pico.hazardRatio) {
+      const value = stripPrefix(pico.hazardRatio, /^(?:a?HR|Hazard\s+Ratio)\s*[:=]?\s*/i);
+      return { fullLabel: 'Hazard Ratio', shortLabel: 'HR', value, combined: `HR ${value}` };
+    }
+
+    if (pico.riskRatio) {
+      if (/^a?OR\b/i.test(pico.riskRatio)) {
+        const value = stripPrefix(pico.riskRatio, /^(?:a?OR|Odds\s+Ratio)\s*[:=]?\s*/i);
+        return { fullLabel: 'Odds Ratio', shortLabel: 'OR', value, combined: `OR ${value}` };
+      }
+      const value = stripPrefix(pico.riskRatio, /^(?:a?RR|Risk\s+Ratio|Relative\s+Risk)\s*[:=]?\s*/i);
+      return { fullLabel: 'Risk Ratio', shortLabel: 'RR', value, combined: `RR ${value}` };
+    }
+
+    const stat = (pico.primaryStatistic || '').trim();
+    if (stat && !/^p\s*[<>]=?/i.test(stat)) {
+      if (/^(?:a?OR|Odds\s+Ratio)\b/i.test(stat)) {
+        const value = stripPrefix(stat, /^(?:a?OR|Odds\s+Ratio)\s*[:=]?\s*/i);
+        return { fullLabel: 'Odds Ratio', shortLabel: 'OR', value, combined: `OR ${value}` };
+      }
+      if (/^(?:a?HR|Hazard\s+Ratio)\b/i.test(stat)) {
+        const value = stripPrefix(stat, /^(?:a?HR|Hazard\s+Ratio)\s*[:=]?\s*/i);
+        return { fullLabel: 'Hazard Ratio', shortLabel: 'HR', value, combined: `HR ${value}` };
+      }
+      if (/^(?:a?RR|Risk\s+Ratio|Relative\s+Risk)\b/i.test(stat)) {
+        const value = stripPrefix(stat, /^(?:a?RR|Risk\s+Ratio|Relative\s+Risk)\s*[:=]?\s*/i);
+        return { fullLabel: 'Risk Ratio', shortLabel: 'RR', value, combined: `RR ${value}` };
+      }
+      if (/^(?:WMD|SMD|MD|Mean\s+Difference)\b/i.test(stat)) {
+        const value = stripPrefix(stat, /^(?:WMD|SMD|MD|Mean\s+Difference)\s*[:=]?\s*/i);
+        return { fullLabel: 'Mean Difference', shortLabel: 'MD', value, combined: `MD ${value}` };
+      }
+      return { fullLabel: 'Effect Estimate', shortLabel: 'Effect', value: stat, combined: stat };
+    }
+
+    return null;
+  };
+
   const formatPrimaryStat = (pico: MedicalDocument['pico']) => {
     if (pico.pValues && pico.pValues.length > 0) return pico.pValues[0];
+    const effect = resolveEffectMetricDisplay(pico);
+    if (effect) return effect.combined;
     if (pico.primaryStatistic) return pico.primaryStatistic;
-    if (pico.hazardRatio) return `HR ${pico.hazardRatio}`;
-    if (pico.riskRatio) return `RR ${pico.riskRatio}`;
     return 'Not reported';
   };
 
@@ -153,22 +211,25 @@ export const RightContext: React.FC<RightContextProps> = ({
 
   const handleExportCsv = () => {
     const headers = ['Source Database', 'Study', 'Year', 'Journal', 'Design', 'Sample Size (N)', 'Population', 'Intervention', 'Comparator', 'Primary Outcome', 'Effect Size / Primary Stat', 'p-Values', 'DOI', 'Web URL'];
-    const rows = documents.map(d => [
-      `"${d.source}"`,
-      `"${formatAuthorShort(d).replace(/"/g, '""')}"`,
-      d.year ?? '"n.d."',
-      `"${d.journal.replace(/"/g, '""')}"`,
-      `"${d.pico.design}"`,
-      d.pico.sampleSize > 0 ? d.pico.sampleSize : '"Not reported"',
-      `"${d.pico.population.replace(/"/g, '""')}"`,
-      `"${d.pico.intervention.replace(/"/g, '""')}"`,
-      `"${d.pico.comparator.replace(/"/g, '""')}"`,
-      `"${d.pico.primaryOutcome.replace(/"/g, '""')}"`,
-      `"${(d.pico.primaryStatistic || d.pico.hazardRatio || d.pico.riskRatio || '').replace(/"/g, '""')}"`,
-      `"${d.pico.pValues.join('; ')}"`,
-      d.doi ? `"https://doi.org/${d.doi}"` : '""',
-      `"${d.webUrl || ''}"`
-    ]);
+    const rows = documents.map(d => {
+      const effectDisplay = resolveEffectMetricDisplay(d.pico);
+      return [
+        `"${d.source}"`,
+        `"${formatAuthorShort(d).replace(/"/g, '""')}"`,
+        d.year ?? '"n.d."',
+        `"${d.journal.replace(/"/g, '""')}"`,
+        `"${d.pico.design}"`,
+        d.pico.sampleSize > 0 ? d.pico.sampleSize : '"Not reported"',
+        `"${d.pico.population.replace(/"/g, '""')}"`,
+        `"${d.pico.intervention.replace(/"/g, '""')}"`,
+        `"${d.pico.comparator.replace(/"/g, '""')}"`,
+        `"${d.pico.primaryOutcome.replace(/"/g, '""')}"`,
+        `"${(effectDisplay?.combined || d.pico.primaryStatistic || '').replace(/"/g, '""')}"`,
+        `"${d.pico.pValues.join('; ')}"`,
+        d.doi ? `"https://doi.org/${d.doi}"` : '""',
+        `"${d.webUrl || ''}"`
+      ];
+    });
 
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
@@ -615,15 +676,35 @@ export const RightContext: React.FC<RightContextProps> = ({
                           <p><strong className="text-teal-900">Intervention:</strong> {doc.pico.intervention}</p>
                           <p><strong className="text-teal-900">Comparator:</strong> {doc.pico.comparator}</p>
                           <p><strong className="text-teal-900">Outcome:</strong> {doc.pico.primaryOutcome}</p>
-                          {doc.pico.primaryStatistic && doc.pico.primaryStatistic !== doc.pico.hazardRatio && (
-                            <p><strong className="text-teal-900">Primary Effect Estimate:</strong> <span className="font-mono font-semibold">{doc.pico.primaryStatistic}</span></p>
-                          )}
-                          {doc.pico.hazardRatio && (
-                            <p><strong className="text-teal-900">Hazard Ratio:</strong> <span className="font-mono font-semibold">{doc.pico.hazardRatio}</span></p>
-                          )}
-                          {doc.pico.riskRatio && (
-                            <p><strong className="text-teal-900">Risk Ratio:</strong> <span className="font-mono font-semibold">{doc.pico.riskRatio}</span></p>
-                          )}
+                          {(() => {
+                            const effect = resolveEffectMetricDisplay(doc.pico);
+                            const primaryChipValue = formatPrimaryStat(doc.pico);
+                            const normalizeCmp = (s?: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                            const extraPrimaryStat =
+                              doc.pico.primaryStatistic &&
+                              normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(primaryChipValue) &&
+                              normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(effect?.combined) &&
+                              normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(effect?.value)
+                                ? doc.pico.primaryStatistic
+                                : null;
+
+                            return (
+                              <>
+                                {effect && (
+                                  <p>
+                                    <strong className="text-teal-900">{effect.fullLabel}:</strong>{' '}
+                                    <span className="font-mono font-semibold">{effect.value}</span>
+                                  </p>
+                                )}
+                                {extraPrimaryStat && (
+                                  <p>
+                                    <strong className="text-teal-900">Primary Effect Estimate:</strong>{' '}
+                                    <span className="font-mono font-semibold">{extraPrimaryStat}</span>
+                                  </p>
+                                )}
+                              </>
+                            );
+                          })()}
                         </div>
 
                         <div>
@@ -998,24 +1079,34 @@ export const RightContext: React.FC<RightContextProps> = ({
                         {doc.pico.primaryOutcome}
                       </td>
                       <td className="p-2.5 whitespace-nowrap">
-                        {doc.pico.hazardRatio && (
-                          <div className="font-mono text-[10px] text-slate-700">
-                            HR: <span className="font-semibold">{doc.pico.hazardRatio}</span>
-                          </div>
-                        )}
-                        {doc.pico.riskRatio && (
-                          <div className="font-mono text-[10px] text-slate-700">
-                            RR: <span className="font-semibold">{doc.pico.riskRatio}</span>
-                          </div>
-                        )}
-                        {doc.pico.primaryStatistic && doc.pico.primaryStatistic !== doc.pico.hazardRatio && (
-                          <div className="font-mono text-[10px] text-indigo-800 mb-0.5 max-w-[180px] truncate" title={doc.pico.primaryStatistic}>
-                            {doc.pico.primaryStatistic}
-                          </div>
-                        )}
-                        <span className="font-mono text-[10px] text-teal-800 bg-teal-50 px-1 py-0.5 rounded font-semibold border border-teal-200">
-                          {doc.pico.pValues[0] || (doc.pico.primaryStatistic ? 'p-value: Not reported' : 'Not reported')}
-                        </span>
+                        {(() => {
+                          const effect = resolveEffectMetricDisplay(doc.pico);
+                          const pVal = doc.pico.pValues?.[0];
+                          const normalizeCmp = (s?: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                          const showExtraStat =
+                            doc.pico.primaryStatistic &&
+                            normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(pVal) &&
+                            normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(effect?.combined) &&
+                            normalizeCmp(doc.pico.primaryStatistic) !== normalizeCmp(effect?.value);
+
+                          return (
+                            <>
+                              {effect && (
+                                <div className="font-mono text-[10px] text-slate-700">
+                                  {effect.shortLabel}: <span className="font-semibold">{effect.value}</span>
+                                </div>
+                              )}
+                              {showExtraStat && (
+                                <div className="font-mono text-[10px] text-indigo-800 mb-0.5 max-w-[180px] truncate" title={doc.pico.primaryStatistic}>
+                                  {doc.pico.primaryStatistic}
+                                </div>
+                              )}
+                              <span className="font-mono text-[10px] text-teal-800 bg-teal-50 px-1 py-0.5 rounded font-semibold border border-teal-200">
+                                {pVal || (effect || showExtraStat ? 'p-value: Not reported' : 'Not reported')}
+                              </span>
+                            </>
+                          );
+                        })()}
                       </td>
                     </tr>
                   ))}

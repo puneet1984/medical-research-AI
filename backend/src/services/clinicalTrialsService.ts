@@ -282,6 +282,8 @@ function abbreviateParamType(rawType?: unknown): string {
 
 export interface CtGovExtractedStats {
   pValues: string[];
+  effectMetricType?: 'HR' | 'OR' | 'RR' | 'MD' | null;
+  effectEstimate?: string;
   hazardRatio?: string;
   riskRatio?: string;
   primaryStatistic?: string;
@@ -307,6 +309,8 @@ export function extractCtGovResults(resultsSection: any): CtGovExtractedStats {
 
   const pValues: string[] = [];
   const seenP = new Set<string>();
+  let effectMetricType: 'HR' | 'OR' | 'RR' | 'MD' | null = null;
+  let effectEstimate: string | undefined;
   let hazardRatio: string | undefined;
   let riskRatio: string | undefined;
   let primaryStatistic: string | undefined;
@@ -346,12 +350,29 @@ export function extractCtGovResults(resultsSection: any): CtGovExtractedStats {
         const statLabel = `${paramAbbr} ${valWithUnit}${ciPart}`.trim();
 
         const lowerType = paramTypeRaw.toLowerCase();
-        if (!hazardRatio && (lowerType.includes('hazard') || paramAbbr === 'HR')) {
-          hazardRatio = `${valWithUnit}${ciPart}`.trim();
-        } else if (!riskRatio && (lowerType.includes('risk ratio') || lowerType.includes('relative risk') || paramAbbr === 'RR')) {
-          riskRatio = `${valWithUnit}${ciPart}`.trim();
-        } else if (!riskRatio && (lowerType.includes('odds ratio') || paramAbbr === 'OR')) {
-          riskRatio = statLabel;
+        const estimateValue = `${valWithUnit}${ciPart}`.trim();
+        if (lowerType.includes('hazard') || paramAbbr === 'HR') {
+          if (!hazardRatio) hazardRatio = estimateValue;
+          if (!effectMetricType) {
+            effectMetricType = 'HR';
+            effectEstimate = estimateValue;
+          }
+        } else if (lowerType.includes('risk ratio') || lowerType.includes('relative risk') || paramAbbr === 'RR') {
+          if (!riskRatio) riskRatio = estimateValue;
+          if (!effectMetricType) {
+            effectMetricType = 'RR';
+            effectEstimate = estimateValue;
+          }
+        } else if (lowerType.includes('odds ratio') || paramAbbr === 'OR') {
+          if (!effectMetricType) {
+            effectMetricType = 'OR';
+            effectEstimate = estimateValue;
+          }
+        } else if (lowerType.includes('mean difference') || paramAbbr === 'MD' || paramAbbr === 'WMD' || paramAbbr === 'SMD') {
+          if (!effectMetricType) {
+            effectMetricType = 'MD';
+            effectEstimate = estimateValue;
+          }
         }
 
         if (!primaryStatistic) {
@@ -369,6 +390,8 @@ export function extractCtGovResults(resultsSection: any): CtGovExtractedStats {
 
   return {
     pValues: pValues.slice(0, 6),
+    effectMetricType,
+    effectEstimate,
     hazardRatio,
     riskRatio,
     primaryStatistic,
@@ -442,6 +465,8 @@ export function mapProtocolSectionToDocument(
     comparator,
     primaryOutcome,
     pValues: extractedStats.pValues,
+    effectMetricType: extractedStats.effectMetricType ?? null,
+    effectEstimate: extractedStats.effectEstimate,
     hazardRatio: extractedStats.hazardRatio,
     riskRatio: extractedStats.riskRatio,
     primaryStatistic: extractedStats.primaryStatistic,
@@ -1027,6 +1052,13 @@ export async function enrichNctRecords(studies: MedicalDocument[], maxToEnrich =
     const regP = Array.isArray(reg.pico?.pValues) ? reg.pico.pValues : [];
     const mergedPValues = Array.from(new Set([...existingP, ...regP])).slice(0, 6);
 
+    const mergedMetricType = doc.pico?.effectMetricType || reg.pico.effectMetricType || null;
+    const mergedEstimate = doc.pico?.effectEstimate || reg.pico.effectEstimate;
+    let mergedRiskRatio = doc.pico?.riskRatio || reg.pico.riskRatio;
+    if (mergedMetricType === 'OR' && mergedRiskRatio && /^OR\b/i.test(mergedRiskRatio)) {
+      mergedRiskRatio = undefined;
+    }
+
     const updatedPico: PicoData = {
       ...doc.pico,
       sampleSize: doc.pico?.sampleSize && doc.pico.sampleSize > 0 ? doc.pico.sampleSize : reg.pico.sampleSize,
@@ -1035,15 +1067,17 @@ export async function enrichNctRecords(studies: MedicalDocument[], maxToEnrich =
       comparator: doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : reg.pico.comparator,
       primaryOutcome: doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : reg.pico.primaryOutcome,
       pValues: mergedPValues,
+      effectMetricType: mergedMetricType,
+      effectEstimate: mergedEstimate,
       hazardRatio: doc.pico?.hazardRatio || reg.pico.hazardRatio,
-      riskRatio: doc.pico?.riskRatio || reg.pico.riskRatio,
+      riskRatio: mergedRiskRatio,
       primaryStatistic:
         doc.pico?.primaryStatistic ||
         reg.pico.primaryStatistic ||
+        (mergedMetricType && mergedEstimate ? `${mergedMetricType} ${mergedEstimate}` : undefined) ||
         doc.pico?.hazardRatio ||
         reg.pico.hazardRatio ||
-        doc.pico?.riskRatio ||
-        reg.pico.riskRatio,
+        mergedRiskRatio,
       design: doc.pico?.design === 'Observational / Descriptive Study' ? reg.pico.design : doc.pico.design
     };
 

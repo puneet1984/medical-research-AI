@@ -13,6 +13,11 @@ import { enrichIsrctnRecords } from './isrctnService.js';
 import { deduplicateAndMergeStudies } from '../utils/deduplicateStudies.js';
 import { generateLocalEmbedding, cosineSimilarity } from './embeddingService.js';
 import {
+  extractAbstractScopeForSampleSize,
+  enrichTopStudiesPicoWithLlm,
+  EffectMetricType
+} from './picoExtractorService.js';
+import {
   decodeHtmlEntities,
   sanitizeJournalField,
   sanitizeDoi,
@@ -34,6 +39,8 @@ export interface PicoData {
   comparator: string;
   primaryOutcome: string;
   pValues: string[];
+  effectMetricType?: EffectMetricType | null;
+  effectEstimate?: string;
   hazardRatio?: string;
   riskRatio?: string;
   primaryStatistic?: string;
@@ -162,14 +169,22 @@ const CLINICAL_NOUNS = '(?:patients|participants|subjects|individuals|cases|frac
 const CLINICAL_QUALIFIERS = '(?:consecutive\\s+|elderly\\s+|adult\\s+|pediatric\\s+|female\\s+|male\\s+|unselected\\s+|eligible\\s+|evaluated\\s+|admitted\\s+)?';
 
 /**
- * Extracts sample size (N) from text using clinical regex patterns and study design context.
- * Accurately parses numbers written in words (e.g. "Forty-seven patients" -> 47).
- * NEVER assumes or invents 350. If sample size is not specified in the abstract, returns 0.
- * For single case reports, accurately returns 1 (or small case count for series).
+ * Extracts cohort sample size (N) strictly from scoped Abstract (Aims, Methods, Results) and/or PMC Methods text.
+ * Prioritizes explicit cohort phrases ("examined X cases", "enrolled X patients", "cohort of X", "total of X participants", "n = X")
+ * over generic numbers or parenthetical subgroup counts.
+ * NEVER assumes or invents 350. Returns 0 if sample size is not explicitly reported.
  */
 export function extractSampleSize(text: string, title = '', design?: PicoData['design']): number {
-  const combined = ((title || '') + ' ' + (text || ''))
-    .replace(/&#xa0;|&nbsp;|&#160;/gi, ' ')
+  return extractSampleSizeWithTier(text, title, design).sampleSize;
+}
+
+export function extractSampleSizeWithTier(
+  text: string,
+  title = '',
+  design?: PicoData['design']
+): { sampleSize: number; tier: 0 | 1 | 2 } {
+  if (!text && !title) return { sampleSize: 0, tier: 0 };
+  const combined = decodeHtmlEntities(`${title || ''} ${text || ''}`)
     .replace(/\u00a0/g, ' ')
     .trim();
 
@@ -185,98 +200,125 @@ export function extractSampleSize(text: string, title = '', design?: PicoData['d
     /\ba\s+rare\s+case\b/i.test(combined) ||
     /\ba\s+\d{1,2}[-\s]year[-\s]old\s+(?:male|female|man|woman|patient|child|infant|boy|girl)\b/i.test(combined);
 
-  // If a specific small series count is described (e.g. "series of 3 cases", "two cases")
-  const caseSeriesCountMatch = combined.match(/\b(?:series\s+of|report\s+of|analyzed|evaluated|described|treated)\s+(\d{1,2})\s+cases\b/i);
+  // If a specific small series count is described (e.g. "series of 3 cases")
+  const caseSeriesCountMatch = combined.match(/\b(?:series\s+of|report\s+of|analyzed|analysed|evaluated|examined|described|treated)\s+(\d{1,2})\s+cases\b/i);
   if (caseSeriesCountMatch && caseSeriesCountMatch[1]) {
     const parsed = parseInt(caseSeriesCountMatch[1], 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed <= 50) return parsed;
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 50) return { sampleSize: parsed, tier: 1 };
   }
 
-  // 2. Candidate collection for trials and cohort studies (both numbers in words and digits)
-  const candidates: number[] = [];
-
-  // Pattern A: Numbers written in words preceding clinical nouns (e.g. "Forty-seven patients", "eighty-two cases")
-  // Ensures hyphenated words like Forty-seven are captured whole without being split at the hyphen
-  const wordSampleRegex = new RegExp(`(^|[^a-zA-Z-])(${WORD_NUMBER_PHRASE})\\s+${CLINICAL_QUALIFIERS}${CLINICAL_NOUNS}\\b`, 'gi');
-  const wordMatches = [...combined.matchAll(wordSampleRegex)];
-  for (const wm of wordMatches) {
-    if (wm[2]) {
-      const parsed = parseWordsToNumber(wm[2]);
-      if (parsed && parsed > 0 && parsed < 10000000) {
-        candidates.push(parsed);
-      }
+  // 2. Candidate collection split into Tier 1 (explicit cohort phrases) vs Tier 2 (generic/subgroup/screened-pool numbers)
+  const tier1Candidates: number[] = [];
+  const tier2Candidates: number[] = [];
+  const pushValid = (arr: number[], n: number | null) => {
+    if (n !== null && Number.isFinite(n) && n > 0 && n < 10_000_000) {
+      arr.push(n);
     }
-  }
+  };
 
-  // Pattern B: Enrollment verbs with numbers written in words (e.g. "total of forty-seven", "enrolled sixty-two")
-  const verbWordRegex = new RegExp(`\\b(?:total\\s+of|cohort\\s+of|sample\\s+of|enrolled|recruited|analyzed|evaluated|included|consisted\\s+of|studied|operated\\s+on|treated)\\s+(?:a\\s+total\\s+of\\s+)?(${WORD_NUMBER_PHRASE})\\b`, 'gi');
-  const verbWordMatches = [...combined.matchAll(verbWordRegex)];
-  for (const vwm of verbWordMatches) {
+  // Helper: detects institutional/annual volume or pre-exclusion screened pools ("1,631 patients ... Of these, 147 met inclusion criteria")
+  const isScreenedOrAnnualPool = (matchIdx: number, matchLen: number): boolean => {
+    const before = combined.slice(Math.max(0, matchIdx - 45), matchIdx);
+    const after = combined.slice(matchIdx + matchLen, Math.min(combined.length, matchIdx + matchLen + 140));
+    if (/\b(?:screened|assessed\s+for\s+eligibility|initially\s+identified|approximately)\b/i.test(before)) {
+      return true;
+    }
+    if (/^\s*(?:annually|per\s+year|each\s+year)\b/i.test(after) || /\b(?:cases|patients)\s+(?:annually|per\s+year)\b/i.test(after.slice(0, 40))) {
+      return true;
+    }
+    if (/\b(?:of\s+these|of\s+whom|among\s+these|after\s+exclusions?)\b/i.test(after)) {
+      return true;
+    }
+    return false;
+  };
+
+  // Tier 1A: Enrollment/examination verbs with numbers written in words
+  const verbWordRegex = new RegExp(`\\b(?:examined|enrolled|recruited|analyzed|analysed|evaluated|included|consisted\\s+of|studied|operated\\s+on|treated|reviewed|identified|assessed|total\\s+of|cohort\\s+of|sample\\s+of)\\s+(?:a\\s+total\\s+of\\s+)?(${WORD_NUMBER_PHRASE})\\b`, 'gi');
+  for (const vwm of combined.matchAll(verbWordRegex)) {
     if (vwm[1]) {
-      const parsed = parseWordsToNumber(vwm[1]);
-      if (parsed && parsed > 0 && parsed < 10000000) {
-        candidates.push(parsed);
-      }
+      const target = isScreenedOrAnnualPool(vwm.index || 0, vwm[0].length) ? tier2Candidates : tier1Candidates;
+      pushValid(target, parseWordsToNumber(vwm[1]));
     }
   }
 
-  // Pattern C: Clinical enrollment verbs with digits: "enrolled 142 patients", "total of 142 participants"
-  const enrolledMatch = combined.match(/\b(?:total\s+of|cohort\s+of|sample\s+of|enrolled|recruited|analyzed|evaluated|included|consisted\s+of|studied|operated\s+on|treated)\s+(?:a\s+total\s+of\s+)?(\d{1,3}(?:,\d{3})*|\d+)\s*(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs|limbs|implants)\b/i);
-  if (enrolledMatch && enrolledMatch[1]) {
-    const parsed = parseInt(enrolledMatch[1].replace(/,/g, ''), 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  // Tier 1B: Explicit cohort phrases with digits ("examined 147 cases", "enrolled 120 patients", "cohort of 84", "total of 200 participants")
+  const explicitCohortRegex = /\b(?:examined|enrolled|recruited|analyzed|analysed|evaluated|included|consisted\s+of|studied|operated\s+on|treated|reviewed|identified|assessed)\s+(?:a\s+total\s+of\s+)?(\d{1,3}(?:,\d{3})*|\d+)\s*(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs|limbs|implants|adults|children|infants|men|women)\b/gi;
+  for (const em of combined.matchAll(explicitCohortRegex)) {
+    if (em[1]) {
+      const target = isScreenedOrAnnualPool(em.index || 0, em[0].length) ? tier2Candidates : tier1Candidates;
+      pushValid(target, parseInt(em[1].replace(/,/g, ''), 10));
+    }
   }
 
-  // Pattern D: "X patients were randomized / enrolled / included / treated"
-  const wereMatch = combined.match(/\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs)\s+(?:were|with|undergoing|treated|randomized|enrolled|included|admitted|operated|received)\b/i);
-  if (wereMatch && wereMatch[1]) {
-    const parsed = parseInt(wereMatch[1].replace(/,/g, ''), 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  const cohortTotalRegex = /\b(?:a\s+)?(?:total\s+of|cohort\s+of|sample\s+of)\s+(\d{1,3}(?:,\d{3})*|\d+)\s*(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs|limbs|implants|adults|children|infants|men|women)?\b/gi;
+  for (const cm of combined.matchAll(cohortTotalRegex)) {
+    if (cm[1]) {
+      const target = isScreenedOrAnnualPool(cm.index || 0, cm[0].length) ? tier2Candidates : tier1Candidates;
+      pushValid(target, parseInt(cm[1].replace(/,/g, ''), 10));
+    }
   }
 
-  // Pattern E: Explicit N = / n = patterns (e.g. "N = 84", "n=120", "sample size of 250")
-  const explicitN = combined.match(/\b(?:[Nn]\s*=\s*|sample\s*size\s*(?:of|was|=)\s*)(\d{1,3}(?:,\d{3})*|\d+)\b/);
-  if (explicitN && explicitN[1]) {
-    const parsed = parseInt(explicitN[1].replace(/,/g, ''), 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  // Tier 1C: "X consecutive patients were enrolled / included / examined / treated / randomized / analyzed"
+  const wereRegex = /\b(\d{1,3}(?:,\d{3})*|\d+)\s+(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases|fractures|hips|femurs)\s+(?:were|with|undergoing|treated|randomized|randomised|enrolled|included|examined|analyzed|analysed|evaluated|admitted|operated|received|met\s+(?:the\s+)?inclusion)\b/gi;
+  for (const wm of combined.matchAll(wereRegex)) {
+    if (wm[1]) {
+      const target = isScreenedOrAnnualPool(wm.index || 0, wm[0].length) ? tier2Candidates : tier1Candidates;
+      pushValid(target, parseInt(wm[1].replace(/,/g, ''), 10));
+    }
   }
 
-  // Pattern F: General "X patients/participants/subjects"
-  const generalMatch = combined.match(/\b([1-9]\d{0,5})\s+(?:elderly\s+)?(?:patients|participants|adults|individuals|subjects)\b/i);
-  if (generalMatch && generalMatch[1]) {
-    const parsed = parseInt(generalMatch[1], 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+  // Tier 1C-2: "all 147 patients ... were included in the final analysis / met the inclusion criteria"
+  const includedFinalRegex = /\b(?:all\s+)?(\d{1,3}(?:,\d{3})*|\d+)\s+(?:consecutive\s+)?(?:patients|participants|subjects|individuals|cases)\b[^.]{0,90}?\b(?:met\s+(?:the\s+)?inclusion\s+criteria|included\s+in\s+(?:the\s+)?(?:final\s+)?analysis)\b/gi;
+  for (const im of combined.matchAll(includedFinalRegex)) {
+    if (im[1]) pushValid(tier1Candidates, parseInt(im[1].replace(/,/g, ''), 10));
   }
 
-  // Pattern G: Table/Methods rows such as "Total patients | 120", "Sample size: 84", "Patients (n = 96)"
-  const tableTotalMatches = combined.matchAll(/\b(?:total\s+(?:cohort|sample|patients|participants|subjects|cases|fractures|population)|sample\s*size)\s*(?:\([^)]*\))?\s*[:=|]\s*(\d{1,3}(?:,\d{3})*|\d+)\b/gi);
-  for (const tm of tableTotalMatches) {
+  // Tier 1D: Table/Methods rows & explicit sample size headers ("Total patients | 120", "Sample size: 84", "Patients (N = 147)")
+  const tableTotalRegex = /\b(?:total\s+(?:cohort|sample|patients|participants|subjects|cases|fractures|population)|sample\s*size)\s*(?:\([^)]*\))?\s*(?:of|was|[:=|])\s*(\d{1,3}(?:,\d{3})*|\d+)\b/gi;
+  for (const tm of combined.matchAll(tableTotalRegex)) {
     if (tm[1]) {
-      const parsed = parseInt(tm[1].replace(/,/g, ''), 10);
-      if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
+      const target = isScreenedOrAnnualPool(tm.index || 0, tm[0].length) ? tier2Candidates : tier1Candidates;
+      pushValid(target, parseInt(tm[1].replace(/,/g, ''), 10));
     }
   }
-  const parenNMatches = combined.matchAll(/\b(?:patients|participants|subjects|individuals|cases|fractures|cohort)\s*\(\s*[Nn]\s*(?:\|\s*)?[=:]?\s*(\d{1,3}(?:,\d{3})*|\d+)\s*\)/gi);
-  for (const pm of parenNMatches) {
-    if (pm[1]) {
-      const parsed = parseInt(pm[1].replace(/,/g, ''), 10);
-      if (!isNaN(parsed) && parsed > 0 && parsed < 10000000) candidates.push(parsed);
-    }
+  const parenNRegex = /\b(?:patients|participants|subjects|individuals|cases|fractures|cohort)\s*\(\s*[Nn]\s*(?:\|\s*)?[=:]?\s*(\d{1,3}(?:,\d{3})*|\d+)\s*\)/gi;
+  for (const pm of combined.matchAll(parenNRegex)) {
+    if (pm[1]) pushValid(tier1Candidates, parseInt(pm[1].replace(/,/g, ''), 10));
   }
 
-  // If identified as a single case report and no larger cohort was found: exactly 1 patient
+  // Tier 1E / Tier 2: Explicit "N = X" / "n = X" (study-level N = X goes to Tier 1; percentage subgroup "% (n = X)" goes to Tier 2)
+  const explicitNRegex = /\b([Nn])\s*=\s*(\d{1,3}(?:,\d{3})*|\d+)\b/g;
+  for (const nm of combined.matchAll(explicitNRegex)) {
+    const val = parseInt(nm[2].replace(/,/g, ''), 10);
+    const idx = nm.index || 0;
+    const prefixCtx = combined.slice(Math.max(0, idx - 16), idx);
+    const isSubgroupPercent = /%\s*\(\s*$/.test(prefixCtx) || /\b(?:isolates|recurrence|coinfections?|events?|deaths?|positive)\b/i.test(combined.slice(idx, idx + 35));
+    pushValid(isSubgroupPercent ? tier2Candidates : tier1Candidates, val);
+  }
+
+  // Tier 2: Word numbers preceding clinical nouns & generic "X patients/participants/subjects"
+  const wordSampleRegex = new RegExp(`(^|[^a-zA-Z-])(${WORD_NUMBER_PHRASE})\\s+${CLINICAL_QUALIFIERS}${CLINICAL_NOUNS}\\b`, 'gi');
+  for (const wm of combined.matchAll(wordSampleRegex)) {
+    if (wm[2]) pushValid(tier2Candidates, parseWordsToNumber(wm[2]));
+  }
+  const generalRegex = /\b([1-9]\d{0,5})\s+(?:elderly\s+)?(?:patients|participants|adults|individuals|subjects)\b/gi;
+  for (const gm of combined.matchAll(generalRegex)) {
+    if (gm[1]) pushValid(tier2Candidates, parseInt(gm[1], 10));
+  }
+
   if (isCaseReport) {
-    const smallCandidate = candidates.find(c => c > 0 && c <= 10);
-    return smallCandidate || 1;
+    const smallCandidate = [...tier1Candidates, ...tier2Candidates].find(c => c > 0 && c <= 10);
+    return { sampleSize: smallCandidate || 1, tier: smallCandidate ? 1 : 2 };
   }
 
-  // If candidate cohort sizes were found, return the maximum (total trial cohort >= subgroup arm)
-  if (candidates.length > 0) {
-    return Math.max(...candidates);
+  if (tier1Candidates.length > 0) {
+    return { sampleSize: Math.max(...tier1Candidates), tier: 1 };
+  }
+  if (tier2Candidates.length > 0) {
+    return { sampleSize: Math.max(...tier2Candidates), tier: 2 };
   }
 
-  // 3. If sample size is NOT stated in the text, return 0 (never make up 350)
-  return 0;
+  return { sampleSize: 0, tier: 0 };
 }
 
 /**
@@ -448,18 +490,47 @@ export function inferStudyDesign(title: string, abstract: string, meshOrPubTypes
   return 'Observational / Descriptive Study';
 }
 
-function extractHazardRatioFromText(text: string): string | undefined {
-  if (!text) return undefined;
-  const hrMatch = text.match(/\b(?:HR|aHR|hazard ratio)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
-  return hrMatch ? hrMatch[1].trim() : undefined;
-}
+export function extractEffectMetricFromText(text: string): {
+  effectMetricType: EffectMetricType | null;
+  effectEstimate?: string;
+  hazardRatio?: string;
+  riskRatio?: string;
+} {
+  if (!text) return { effectMetricType: null };
 
-function extractRiskRatioFromText(text: string): string | undefined {
-  if (!text) return undefined;
-  const rrMatch = text.match(/\b(?:RR|aRR|risk ratio|relative risk)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
-  if (rrMatch) return rrMatch[1].trim();
-  const orMatch = text.match(/\b(?:OR|aOR|odds ratio)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*\(95%?\s*CI[,:\s]*[0-9]+\.[0-9]{1,3}[-–to\s]+[0-9]+\.[0-9]{1,3}\))?)/i);
-  return orMatch ? `OR ${orMatch[1].trim()}` : undefined;
+  const hrMatch = text.match(
+    /\b(?:hazard\s+ratio\s*(?:\(\s*a?HR\s*\))?|aHR|HR)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*[\[(][^)\]]*(?:95%?\s*CI|CI)[^)\]]*[\])])?)/i
+  );
+  const orMatch = text.match(
+    /\b(?:odds\s+ratio\s*(?:\(\s*a?OR\s*\))?|aOR|OR)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*[\[(][^)\]]*(?:95%?\s*CI|CI)[^)\]]*[\])])?)/i
+  );
+  const rrMatch = text.match(
+    /\b(?:risk\s+ratio\s*(?:\(\s*a?RR\s*\))?|relative\s+risk\s*(?:\(\s*a?RR\s*\))?|aRR|RR)\s*[:=]?\s*([0-9]+\.[0-9]{1,3}(?:\s*[\[(][^)\]]*(?:95%?\s*CI|CI)[^)\]]*[\])])?)/i
+  );
+  const mdMatch = text.match(
+    /\b(?:mean\s+difference\s*(?:\(\s*(?:MD|WMD|SMD)\s*\))?|WMD|SMD|MD)\s*[:=]?\s*(-?[0-9]+\.[0-9]{1,3}(?:\s*[\[(][^)\]]*(?:95%?\s*CI|CI)[^)\]]*[\])])?)/i
+  );
+
+  const hazardRatio = hrMatch?.[1]?.trim();
+  const oddsRatio = orMatch?.[1]?.trim();
+  const riskRatio = rrMatch?.[1]?.trim();
+  const meanDiff = mdMatch?.[1]?.trim();
+
+  const candidates: Array<{ type: EffectMetricType; val: string; index: number }> = [];
+  if (hazardRatio && hrMatch?.index !== undefined) candidates.push({ type: 'HR', val: hazardRatio, index: hrMatch.index });
+  if (oddsRatio && orMatch?.index !== undefined) candidates.push({ type: 'OR', val: oddsRatio, index: orMatch.index });
+  if (riskRatio && rrMatch?.index !== undefined) candidates.push({ type: 'RR', val: riskRatio, index: rrMatch.index });
+  if (meanDiff && mdMatch?.index !== undefined) candidates.push({ type: 'MD', val: meanDiff, index: mdMatch.index });
+
+  candidates.sort((a, b) => a.index - b.index);
+  const primary = candidates[0];
+
+  return {
+    effectMetricType: primary ? primary.type : null,
+    effectEstimate: primary ? primary.val : undefined,
+    hazardRatio,
+    riskRatio
+  };
 }
 
 const MID_CLAUSE_FRAGMENT_START_RE = /^(?:and|or|but|nor|so|yet|of|in|on|at|to|from|by|for|with|as|into|onto|upon|over|under|than|then|that|which|who|whom|whose|where|when|while|whether|if|although|though|because|since|unless|until|during|before|after|between|among|within|without|via|per|vs|versus|et|al|was|were|is|are|am|be|been|being|have|has|had|do|does|did|can|could|may|might|must|shall|should|will|would|the|a|an|this|these|those|such|each|every|either|neither|both|all|some|any|no|not|other|another|respectively|significantly|previously|currently|however|therefore|moreover|furthermore|receiving|undergoing|treated|assigned|allocated|enrolled|included|evaluated|assessed|measured|reported|observed|compared|using|used|based|associated|showing|demonstrating|revealing)\b/;
@@ -468,6 +539,7 @@ const DANGLING_END_RE = /\b(?:and|or|of|in|on|at|to|for|with|by|from|as|the|a|an
 /**
  * Validates extracted PICO string fields (`population`, `intervention`, `comparator`, `primaryOutcome`):
  * - Decodes HTML entities and trims punctuation
+ * - Preserves explicit `"Not applicable (observational cohort)"` labels
  * - Discards -> 'Not reported' if shorter than 3 words
  * - Discards -> 'Not reported' if unparsed ALL-CAPS title/header noise
  * - Discards -> 'Not reported' if starting mid-clause with a lowercase fragment or ending dangling
@@ -481,6 +553,9 @@ export function validateExtractedPicoField(raw?: string): string {
     .trim();
 
   if (!cleaned) return 'Not reported';
+  if (/^not\s+applicable\b/i.test(cleaned)) {
+    return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  }
 
   const words = cleaned.split(/\s+/).filter(Boolean);
   if (words.length < 3) return 'Not reported';
@@ -594,12 +669,17 @@ export function extractPicoData(
     meshOrPubTypes
   );
 
-  let sampleSize = 0;
-  if (useFullText && methodsAndResultsText) {
-    sampleSize = extractSampleSize(methodsAndResultsText, cleanTitle, design);
-  }
-  if (sampleSize === 0) {
-    sampleSize = extractSampleSize(`${cleanTitle} ${cleanAbstract}`, cleanTitle, design);
+  // Strictly restrict cohort sample size (N) extraction to Abstract (Aims, Methods, Results) and PMC Methods ONLY.
+  // Never scan Introduction, Discussion, Tables, or References for N.
+  // Prefer explicit Tier-1 cohort size from Abstract before scanning PMC Methods (prevents institutional screened denominators from overriding included cohort N).
+  const abstractSampleScope = extractAbstractScopeForSampleSize(cleanAbstract);
+  const absSampleResult = extractSampleSizeWithTier(abstractSampleScope, cleanTitle, design);
+  let sampleSize = absSampleResult.sampleSize;
+  if (absSampleResult.tier !== 1 && useFullText && fullTextSections?.methods) {
+    const methodsResult = extractSampleSizeWithTier(fullTextSections.methods, cleanTitle, design);
+    if (methodsResult.tier === 1 || (absSampleResult.tier === 0 && methodsResult.sampleSize > 0)) {
+      sampleSize = methodsResult.sampleSize;
+    }
   }
 
   let pValues: string[] = [];
@@ -610,13 +690,13 @@ export function extractPicoData(
     pValues = extractPValues(cleanAbstract, 4, false);
   }
 
-  const hazardRatio =
-    (useFullText ? extractHazardRatioFromText(resultsAndTablesText) : undefined) ||
-    extractHazardRatioFromText(cleanAbstract);
+  const fullEffects = useFullText ? extractEffectMetricFromText(resultsAndTablesText) : { effectMetricType: null };
+  const absEffects = extractEffectMetricFromText(cleanAbstract);
 
-  const riskRatio =
-    (useFullText ? extractRiskRatioFromText(resultsAndTablesText) : undefined) ||
-    extractRiskRatioFromText(cleanAbstract);
+  const effectMetricType = fullEffects.effectMetricType || absEffects.effectMetricType || null;
+  const effectEstimate = fullEffects.effectMetricType ? fullEffects.effectEstimate : absEffects.effectEstimate;
+  const hazardRatio = fullEffects.hazardRatio || absEffects.hazardRatio;
+  const riskRatio = fullEffects.riskRatio || absEffects.riskRatio;
 
   const population = validateExtractedPicoField(
     (useFullText ? extractPopulationFromText(methodsAndResultsText) : undefined) ||
@@ -639,11 +719,15 @@ export function extractPicoData(
   );
 
   const primaryStatistic =
-    pValues.length > 0
+    effectMetricType && effectEstimate
+      ? `${effectMetricType} ${effectEstimate}`
+      : pValues.length > 0
       ? pValues[0]
       : hazardRatio
       ? `HR ${hazardRatio}`
-      : riskRatio;
+      : riskRatio
+      ? `RR ${riskRatio}`
+      : undefined;
 
   return {
     population,
@@ -652,6 +736,8 @@ export function extractPicoData(
     comparator,
     primaryOutcome,
     pValues,
+    effectMetricType,
+    effectEstimate,
     hazardRatio,
     riskRatio,
     primaryStatistic,
@@ -989,6 +1075,8 @@ async function applyPmcFullTextEnrichment(docs: MedicalDocument[], maxToEnrich =
         const mergedPValues = fullPico.pValues.length > 0 ? fullPico.pValues : (doc.pico?.pValues || []);
         const mergedHr = fullPico.hazardRatio || doc.pico?.hazardRatio;
         const mergedRr = fullPico.riskRatio || doc.pico?.riskRatio;
+        const mergedMetricType = fullPico.effectMetricType || doc.pico?.effectMetricType || null;
+        const mergedEstimate = fullPico.effectEstimate || doc.pico?.effectEstimate;
         doc.pico = {
           ...fullPico,
           sampleSize: fullPico.sampleSize > 0 ? fullPico.sampleSize : (doc.pico?.sampleSize || 0),
@@ -997,9 +1085,16 @@ async function applyPmcFullTextEnrichment(docs: MedicalDocument[], maxToEnrich =
           comparator: fullPico.comparator !== 'Not reported' ? fullPico.comparator : (doc.pico?.comparator || 'Not reported'),
           primaryOutcome: fullPico.primaryOutcome !== 'Not reported' ? fullPico.primaryOutcome : (doc.pico?.primaryOutcome || 'Not reported'),
           pValues: mergedPValues,
+          effectMetricType: mergedMetricType,
+          effectEstimate: mergedEstimate,
           hazardRatio: mergedHr,
           riskRatio: mergedRr,
-          primaryStatistic: fullPico.primaryStatistic || doc.pico?.primaryStatistic || mergedHr || mergedRr
+          primaryStatistic:
+            fullPico.primaryStatistic ||
+            doc.pico?.primaryStatistic ||
+            (mergedMetricType && mergedEstimate ? `${mergedMetricType} ${mergedEstimate}` : undefined) ||
+            mergedHr ||
+            mergedRr
         };
       } else {
         doc.hasFullText = false;
@@ -1783,6 +1878,13 @@ export async function searchAllAvailableStudies(query: string, maxFetch = 500, o
       .sort((a, b) => (b.score || 0) - (a.score || 0));
   }
 
+  // 6. Enrich top 25 ranked studies with structured LLM JSON PICO extraction (falls back to regex if disabled)
+  try {
+    finalPool = await enrichTopStudiesPicoWithLlm(finalPool, 25);
+  } catch (err) {
+    console.warn('[searchService] Top-25 LLM PICO enrichment notice:', err instanceof Error ? err.message : err);
+  }
+
   return {
     allStudies: finalPool,
     totalAvailable: finalPool.length
@@ -1810,6 +1912,8 @@ export const searchService = {
   fetchLandmarkTrialsFromAPI,
   filterAndRankByClinicalRelevance,
   extractPicoData,
+  extractEffectMetricFromText,
+  enrichTopStudiesPicoWithLlm,
   inferStudyDesign
 };
 

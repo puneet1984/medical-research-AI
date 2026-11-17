@@ -105,6 +105,14 @@ function mergePicoData(primary: PicoData, secondary: PicoData): PicoData {
     mergedDesign = secondary.design;
   }
 
+  const effectMetricType = primary?.effectMetricType || secondary?.effectMetricType || null;
+  const effectEstimate = primary?.effectEstimate || secondary?.effectEstimate;
+  const hazardRatio = primary?.hazardRatio || secondary?.hazardRatio;
+  let riskRatio = primary?.riskRatio || secondary?.riskRatio;
+  if (effectMetricType === 'OR' && riskRatio && /^OR\b/i.test(riskRatio)) {
+    riskRatio = undefined;
+  }
+
   return {
     population: pickBetterPicoField(primary?.population, secondary?.population),
     sampleSize: primaryN > 0 ? primaryN : secondaryN,
@@ -112,15 +120,16 @@ function mergePicoData(primary: PicoData, secondary: PicoData): PicoData {
     comparator: pickBetterPicoField(primary?.comparator, secondary?.comparator),
     primaryOutcome: pickBetterPicoField(primary?.primaryOutcome, secondary?.primaryOutcome),
     pValues: mergedPValues,
-    hazardRatio: primary?.hazardRatio || secondary?.hazardRatio,
-    riskRatio: primary?.riskRatio || secondary?.riskRatio,
+    effectMetricType,
+    effectEstimate,
+    hazardRatio,
+    riskRatio,
     primaryStatistic:
       primary?.primaryStatistic ||
       secondary?.primaryStatistic ||
-      primary?.hazardRatio ||
-      secondary?.hazardRatio ||
-      primary?.riskRatio ||
-      secondary?.riskRatio,
+      (effectMetricType && effectEstimate ? `${effectMetricType} ${effectEstimate}` : undefined) ||
+      hazardRatio ||
+      riskRatio,
     design: mergedDesign
   };
 }

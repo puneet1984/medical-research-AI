@@ -5,6 +5,8 @@ export interface PicoData {
   comparator: string;
   primaryOutcome: string;
   pValues: string[];
+  effectMetricType?: 'HR' | 'OR' | 'RR' | 'MD' | null;
+  effectEstimate?: string;
   hazardRatio?: string;
   riskRatio?: string;
   primaryStatistic?: string;

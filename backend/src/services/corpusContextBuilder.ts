@@ -241,6 +241,8 @@ export function sanitizeDocumentMetadata(doc: MedicalDocument): MedicalDocument 
           intervention: decodeHtmlEntities(doc.pico.intervention) || 'Not reported',
           comparator: decodeHtmlEntities(doc.pico.comparator) || 'Not reported',
           primaryOutcome: decodeHtmlEntities(doc.pico.primaryOutcome) || 'Not reported',
+          effectMetricType: doc.pico.effectMetricType ?? null,
+          effectEstimate: doc.pico.effectEstimate ? decodeHtmlEntities(doc.pico.effectEstimate) : undefined,
           hazardRatio: doc.pico.hazardRatio ? decodeHtmlEntities(doc.pico.hazardRatio) : undefined,
           riskRatio: doc.pico.riskRatio ? decodeHtmlEntities(doc.pico.riskRatio) : undefined,
           pValues: (doc.pico.pValues || []).map(p => decodeHtmlEntities(p)).filter(Boolean)
@@ -263,6 +265,7 @@ export function computePicoCompletenessScore(doc: MedicalDocument): number {
     score += 3;
   }
   const hasStats =
+    Boolean(pico.effectEstimate && pico.effectEstimate !== 'Not reported') ||
     Boolean(pico.hazardRatio && pico.hazardRatio !== 'Not reported') ||
     Boolean(pico.riskRatio && pico.riskRatio !== 'Not reported') ||
     Boolean(pico.primaryStatistic && pico.primaryStatistic !== 'Not reported') ||
@@ -847,6 +850,8 @@ export function buildCorpusContext(
       comparator: doc.pico?.comparator && doc.pico.comparator !== 'Not reported' ? doc.pico.comparator : 'Not reported',
       primaryOutcome: doc.pico?.primaryOutcome && doc.pico.primaryOutcome !== 'Not reported' ? doc.pico.primaryOutcome : 'Not reported',
       primaryStatistic: doc.pico?.primaryStatistic || 'Not reported',
+      effectMetricType: doc.pico?.effectMetricType || null,
+      effectEstimate: doc.pico?.effectEstimate || 'Not reported',
       hazardRatio: doc.pico?.hazardRatio || 'Not reported',
       riskRatio: doc.pico?.riskRatio || 'Not reported',
       pValues: Array.isArray(doc.pico?.pValues) && doc.pico.pValues.length > 0
