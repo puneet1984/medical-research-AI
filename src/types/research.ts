@@ -207,7 +207,7 @@ export interface SettingsData {
   omniRouteApiKeyMasked: string;
   isOmniRouteConfigured: boolean;
   omniRouteLlmModel: string;
-  embeddingProvider: 'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local';
+  embeddingProvider: 'auto' | 'qdrant' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local';
   openRouterEmbeddingModel: string;
   huggingFaceApiKeyMasked: string;
   isHuggingFaceConfigured: boolean;
@@ -220,6 +220,9 @@ export interface SettingsData {
   qdrantUrl: string;
   qdrantApiKeyMasked: string;
   isQdrantConfigured: boolean;
+  qdrantInferenceModel?: string;
+  qdrantUseCloudInference?: boolean;
+  defaultVectorDimension?: number;
 }
 
 export interface PaperSection {

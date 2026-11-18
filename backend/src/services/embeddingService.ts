@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { GoogleGenAI } from '@google/genai';
 
-export let EMBEDDING_DIMENSION = 768;
+export let EMBEDDING_DIMENSION = 384;
 
 export function setEmbeddingDimension(dim: number): void {
   if (dim > 0 && dim !== EMBEDDING_DIMENSION) {
@@ -12,17 +12,18 @@ export function setEmbeddingDimension(dim: number): void {
 
 /**
  * Resolves the native vector dimension for a given embedding provider and model name.
+ * Default Qdrant Cloud Inference (sentence-transformers/all-minilm-l6-v2): 384 dimensions
+ * Local MiniLM-aligned Biomedical Hash: 384 dimensions
  * Google text-embedding-004: 768 dimensions
  * BioBERT / PubMedBERT: 768 dimensions
  * all-MiniLM-L6-v2: 384 dimensions
- * OpenAI text-embedding-3-small: 1536 (or requested 768/384)
  * Nomic Embed Text: 768 dimensions
- * Local Biomedical Hash: defaults to 768 (or matches collection)
  */
 export function getModelNativeDimension(provider: string, modelName: string): number {
   const p = (provider || '').toLowerCase();
   const m = (modelName || '').toLowerCase();
 
+  if (p === 'qdrant' || m.includes('all-minilm-l6-v2')) return 384;
   if (p === 'gemini') return 768; // text-embedding-004 is 768-d
   if (p === 'ollama') {
     if (m.includes('minilm') || m.includes('384')) return 384;
@@ -38,50 +39,60 @@ export function getModelNativeDimension(provider: string, modelName: string): nu
     if (m.includes('large') && !m.includes('bge')) return 3072;
     if (m.includes('1024') || m.includes('cohere') || m.includes('bge-large')) return 1024;
     if (m.includes('text-embedding-3-small')) return 768;
-    return 768;
+    return 384;
   }
   if (p === 'local') {
-    return 768; // Default local dimension aligned with text-embedding-004 & BioBERT
+    return 384; // Aligned with 384-d sentence-transformers/all-minilm-l6-v2 Qdrant default
   }
-  return 768;
+  return 384;
 }
 
 /**
  * Resolves the single active embedding provider, model, and target vector dimension.
- * Guaranteed consistent across indexing and queries to prevent vector space corruption.
+ * Defaults to 384-d `sentence-transformers/all-minilm-l6-v2` (via Qdrant Cloud Inference when
+ * QDRANT_API_KEY is available, or 384-d local MiniLM-aligned space offline) to keep database
+ * and embedding model strictly aligned on 384 dimensions.
  */
-export function getActiveEmbeddingInfo(): { provider: 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local'; model: string; dimension: number } {
+export function getActiveEmbeddingInfo(): {
+  provider: 'qdrant' | 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local';
+  model: string;
+  dimension: number;
+} {
   let provider = config.embeddingProvider as any;
-  let model = 'text-embedding-004';
+  let model = config.qdrantInferenceModel || 'sentence-transformers/all-minilm-l6-v2';
+
+  const hasQdrantKey = Boolean((process.env.QDRANT_API_KEY || config.qdrantApiKey || '').trim());
 
   if (provider === 'auto') {
-    if (process.env.GEMINI_API_KEY || config.geminiApiKey) {
-      provider = 'gemini';
-      model = config.geminiEmbeddingModel || 'text-embedding-004';
+    if (hasQdrantKey && config.qdrantUseCloudInference !== false) {
+      provider = 'qdrant';
+      model = config.qdrantInferenceModel || 'sentence-transformers/all-minilm-l6-v2';
+    } else if (config.huggingFaceApiKey) {
+      provider = 'huggingface';
+      model = config.huggingFaceEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2';
     } else if (config.ollamaUrl && config.ollamaUrl !== 'http://localhost:11434') {
       provider = 'ollama';
       model = config.ollamaEmbeddingModel || 'nomic-embed-text';
     } else if (config.openRouterApiKey) {
       provider = 'openrouter';
-      model = config.openRouterEmbeddingModel || 'openai/text-embedding-3-small';
-    } else if (config.huggingFaceApiKey) {
-      provider = 'huggingface';
-      model = config.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed';
+      model = config.openRouterEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2';
     } else {
       provider = 'local';
-      model = 'biomedical-dense-hash-768';
+      model = 'sentence-transformers/all-minilm-l6-v2-local-384';
     }
+  } else if (provider === 'qdrant') {
+    model = config.qdrantInferenceModel || 'sentence-transformers/all-minilm-l6-v2';
   } else if (provider === 'gemini') {
     model = config.geminiEmbeddingModel || 'text-embedding-004';
   } else if (provider === 'huggingface') {
-    model = config.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed';
+    model = config.huggingFaceEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2';
   } else if (provider === 'openrouter') {
-    model = config.openRouterEmbeddingModel || 'openai/text-embedding-3-small';
+    model = config.openRouterEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2';
   } else if (provider === 'ollama') {
     model = config.ollamaEmbeddingModel || 'nomic-embed-text';
   } else {
     provider = 'local';
-    model = 'biomedical-dense-hash-768';
+    model = 'sentence-transformers/all-minilm-l6-v2-local-384';
   }
 
   const dimension = getModelNativeDimension(provider, model);
@@ -361,11 +372,23 @@ async function fetchGeminiEmbedding(text: string): Promise<number[]> {
  */
 export async function generateEmbeddingAsync(text: string): Promise<{
   vector: number[];
-  provider: 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local';
+  provider: 'qdrant' | 'gemini' | 'ollama' | 'openrouter' | 'huggingface' | 'local';
   model: string;
 }> {
   const active = getActiveEmbeddingInfo();
   const targetDim = EMBEDDING_DIMENSION;
+
+  // 0. Qdrant Cloud Inference (384-d sentence-transformers/all-minilm-l6-v2)
+  // Server-side inference runs directly on Qdrant upsert/query; return aligned 384-d local vector
+  // for local cosine cache/fallback without incurring extra remote embedding calls.
+  if (active.provider === 'qdrant') {
+    const vector = generateLocalEmbedding(text, targetDim);
+    return {
+      vector,
+      provider: 'qdrant',
+      model: active.model
+    };
+  }
 
   // 1. Google Gemini Embeddings (text-embedding-004: Native 768-d)
   if (active.provider === 'gemini') {

@@ -2,16 +2,25 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import { config } from '../config.js';
 import { MedicalDocument } from './searchService.js';
 import {
-  generateEmbedding,
   generateEmbeddingAsync,
   cosineSimilarity,
   EMBEDDING_DIMENSION,
   getActiveEmbeddingInfo,
   setEmbeddingDimension
 } from './embeddingService.js';
+import {
+  DEFAULT_QDRANT_COLLECTION,
+  DEFAULT_QDRANT_EMBEDDING_MODEL,
+  createQdrantCloudClient,
+  ensureQdrant384Collection,
+  isQdrantCloudInferenceEnabled,
+  upsertDocumentTextsToQdrant,
+  queryQdrantByDocumentText,
+  resolveQdrantEnvConfig
+} from './qdrantCloudInferenceService.js';
 import { parseValidPublicationYear, formatPublicationYear } from './corpusContextBuilder.js';
 
-export const COLLECTION_NAME = 'medical_workspace';
+export const COLLECTION_NAME = DEFAULT_QDRANT_COLLECTION;
 
 // Qdrant Cloud Free Tier Physical Storage Allocation: 4 GB (4,096 MB = 4,294,967,296 bytes)
 export const QDRANT_FREE_TIER_DISK_BYTES = 4 * 1024 * 1024 * 1024;
@@ -56,6 +65,8 @@ export interface VectorStatus {
   collectionName: string;
   totalIndexed: number;
   url: string;
+  embeddingModel?: string;
+  cloudInferenceActive?: boolean;
   upsertMode?: string;
   cachedVectorHits?: number;
   vectorAcceleration?: string;
@@ -132,80 +143,30 @@ export async function initQdrant(): Promise<boolean> {
   const activeInfo = getActiveEmbeddingInfo();
   const requiredDimension = activeInfo.dimension;
   setEmbeddingDimension(requiredDimension);
+  const resolvedQdrant = resolveQdrantEnvConfig();
 
   try {
-    qdrantClient = new QdrantClient({
-      url: config.qdrantUrl,
-      apiKey: config.qdrantApiKey || undefined,
-      timeout: 3500,
-      checkCompatibility: false
+    qdrantClient = createQdrantCloudClient({
+      url: resolvedQdrant.url,
+      apiKey: resolvedQdrant.apiKey,
+      timeout: 5000
     });
 
-    // 1. Check if the database/collection exists
-    const collectionsRes = await qdrantClient.getCollections();
-    const collectionExists = collectionsRes.collections.some(c => c.name === COLLECTION_NAME);
-
-    if (!collectionExists) {
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' not found. Creating collection with size: ${requiredDimension} for model '${activeInfo.model}'...`);
-      await qdrantClient.createCollection(COLLECTION_NAME, {
-        vectors: {
-          size: requiredDimension,
-          distance: 'Cosine'
-        },
-        optimizers_config: {
-          default_segment_number: 2
-        },
-        hnsw_config: {
-          m: 16,
-          ef_construct: 100
-        }
-      });
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' created successfully with size ${requiredDimension}.`);
+    // 1. Ensure collection exists and matches the required vector dimension (384-d default)
+    const collState = await ensureQdrant384Collection(qdrantClient, COLLECTION_NAME, requiredDimension);
+    if (collState.created) {
+      console.log(
+        `[vectorService] Qdrant collection '${COLLECTION_NAME}' created with size ${requiredDimension}-d for model '${activeInfo.model}'.`
+      );
+    } else if (collState.recreated) {
+      console.log(
+        `[vectorService] Qdrant collection '${COLLECTION_NAME}' recreated with size ${requiredDimension}-d for model '${activeInfo.model}'.`
+      );
+      clearVectorStore();
     } else {
-      // 1b. Check existing dimension in Qdrant to ensure exact match with active embedding model
-      let existingQdrantDim: number | null = null;
-      try {
-        const collectionInfo = await qdrantClient.getCollection(COLLECTION_NAME);
-        const vParams = (collectionInfo as any)?.config?.params?.vectors;
-        if (typeof vParams?.size === 'number') {
-          existingQdrantDim = vParams.size;
-        } else if (typeof vParams === 'object' && vParams !== null) {
-          const firstKey = Object.keys(vParams)[0];
-          if (firstKey && typeof (vParams as any)[firstKey]?.size === 'number') {
-            existingQdrantDim = (vParams as any)[firstKey].size;
-          }
-        }
-      } catch (collErr) {
-        console.warn('[vectorService] Could not inspect Qdrant collection vector parameters:', collErr);
-      }
-
-      console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' exists. Qdrant dimension: ${existingQdrantDim}, Required: ${requiredDimension} (${activeInfo.model}).`);
-
-      // Enforce dimension consistency: if existing dimension differs, recreate to prevent storage & retrieval failures
-      if (existingQdrantDim && existingQdrantDim !== requiredDimension) {
-        console.warn(`[vectorService] DIMENSION MISMATCH: Qdrant collection '${COLLECTION_NAME}' has size ${existingQdrantDim}, but active model '${activeInfo.model}' uses ${requiredDimension}-d.`);
-        console.log(`[vectorService] Recreating collection '${COLLECTION_NAME}' with size ${requiredDimension} so storage and retrieval do not fail...`);
-        try {
-          await qdrantClient.deleteCollection(COLLECTION_NAME);
-          await qdrantClient.createCollection(COLLECTION_NAME, {
-            vectors: {
-              size: requiredDimension,
-              distance: 'Cosine'
-            },
-            optimizers_config: {
-              default_segment_number: 2
-            },
-            hnsw_config: {
-              m: 16,
-              ef_construct: 100
-            }
-          });
-          console.log(`[vectorService] Qdrant collection '${COLLECTION_NAME}' successfully recreated with size ${requiredDimension} for model '${activeInfo.model}'.`);
-          clearVectorStore();
-        } catch (recreateErr) {
-          console.error('[vectorService] Failed to recreate collection with matching dimension:', recreateErr);
-        }
-      }
+      console.log(
+        `[vectorService] Qdrant collection '${COLLECTION_NAME}' verified (${collState.dimension}-d, model '${activeInfo.model}').`
+      );
     }
 
     // 2. Verify all payload columns (indexes) for structured clinical metadata
@@ -552,8 +513,9 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
   }
   evictedCount += performMemoryRollingEviction(pendingChunks.length);
 
-  // 2. Generate embeddings with bounded concurrency (batches of 10) to respect API limits
+  // 2. Generate embeddings with bounded concurrency (batches of 10) to populate local 384-d store & fallback vectors
   const pointsToUpsert: Array<{ id: number; vector: number[]; payload: Record<string, any> }> = [];
+  const cloudInferenceItems: Array<{ id: number; text: string; payload: Record<string, any> }> = [];
   const EMBED_CONCURRENCY = 10;
 
   for (let i = 0; i < pendingChunks.length; i += EMBED_CONCURRENCY) {
@@ -606,8 +568,15 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
           }
         }
 
+        const pointId = deterministicPointId(chunkKey);
+        cloudInferenceItems.push({
+          id: pointId,
+          text: chunkText,
+          payload
+        });
+
         return {
-          id: deterministicPointId(chunkKey),
+          id: pointId,
           vector,
           payload
         };
@@ -616,18 +585,50 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
     pointsToUpsert.push(...embeddedBatch);
   }
 
-  // 3. Attempt batched upsert to Qdrant if active
+  // 3. Attempt batched upsert to Qdrant if active (preferring 384-d Qdrant Cloud Inference when enabled)
   if (isQdrantReady && qdrantClient) {
     const UPSERT_BATCH_SIZE = 50;
-    try {
+    const activeInfo = getActiveEmbeddingInfo();
+    const useCloudInference =
+      isQdrantCloudInferenceEnabled() &&
+      (activeInfo.provider === 'qdrant' || activeInfo.dimension === 384);
+    const inferenceModel = config.qdrantInferenceModel || DEFAULT_QDRANT_EMBEDDING_MODEL;
+
+    const executeNumericUpsert = async () => {
       for (let i = 0; i < pointsToUpsert.length; i += UPSERT_BATCH_SIZE) {
         const batch = pointsToUpsert.slice(i, i + UPSERT_BATCH_SIZE);
-        await qdrantClient.upsert(COLLECTION_NAME, {
+        await qdrantClient!.upsert(COLLECTION_NAME, {
           wait: true,
           points: batch
         });
       }
-      return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
+    };
+
+    try {
+      if (useCloudInference) {
+        try {
+          await upsertDocumentTextsToQdrant(cloudInferenceItems, {
+            client: qdrantClient,
+            collectionName: COLLECTION_NAME,
+            model: inferenceModel,
+            batchSize: UPSERT_BATCH_SIZE
+          });
+          return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
+        } catch (cloudErr: any) {
+          if (isQdrantOverlimitError(cloudErr)) {
+            throw cloudErr;
+          }
+          console.warn(
+            `[vectorService] Qdrant Cloud Inference upsert fallback to numeric ${EMBEDDING_DIMENSION}-d vectors:`,
+            cloudErr?.message || cloudErr
+          );
+          await executeNumericUpsert();
+          return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
+        }
+      } else {
+        await executeNumericUpsert();
+        return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
+      }
     } catch (err: any) {
       if (isQdrantOverlimitError(err)) {
         console.warn(`[vectorService] Qdrant reported OVERLIMIT condition (${err?.message || err}). Triggering emergency rolling FIFO eviction of oldest records...`);
@@ -637,12 +638,15 @@ export async function upsertDocuments(docs: MedicalDocument[]): Promise<{ count:
         );
         evictedCount += emergencyEvicted;
         try {
-          for (let i = 0; i < pointsToUpsert.length; i += UPSERT_BATCH_SIZE) {
-            const batch = pointsToUpsert.slice(i, i + UPSERT_BATCH_SIZE);
-            await qdrantClient.upsert(COLLECTION_NAME, {
-              wait: true,
-              points: batch
+          if (useCloudInference) {
+            await upsertDocumentTextsToQdrant(cloudInferenceItems, {
+              client: qdrantClient,
+              collectionName: COLLECTION_NAME,
+              model: inferenceModel,
+              batchSize: UPSERT_BATCH_SIZE
             });
+          } else {
+            await executeNumericUpsert();
           }
           console.log(`[vectorService] Successfully recovered: Qdrant upsert completed after emergency rolling eviction of ${emergencyEvicted} points.`);
           return { count: docs.length, mode: 'qdrant', evicted: evictedCount };
@@ -677,19 +681,47 @@ export async function searchSimilar(query: string, limit = 25): Promise<VectorSe
   if (isQdrantReady && qdrantClient) {
     try {
       const clientAny = qdrantClient as any;
-      const qdrantResults: any[] = typeof clientAny.search === 'function'
-        ? await clientAny.search(COLLECTION_NAME, {
-            vector: queryVector,
+      const activeInfo = getActiveEmbeddingInfo();
+      const useCloudInference =
+        isQdrantCloudInferenceEnabled() &&
+        (activeInfo.provider === 'qdrant' || activeInfo.dimension === 384);
+      const inferenceModel = config.qdrantInferenceModel || DEFAULT_QDRANT_EMBEDDING_MODEL;
+
+      let qdrantResults: any[] = [];
+
+      if (useCloudInference) {
+        try {
+          const cloudRes = await queryQdrantByDocumentText(query, {
+            client: qdrantClient,
+            collectionName: COLLECTION_NAME,
+            model: inferenceModel,
             limit: candidateLimit,
-            with_payload: true
-          })
-        : typeof clientAny.query === 'function'
-        ? (await clientAny.query(COLLECTION_NAME, {
-            query: queryVector,
-            limit: candidateLimit,
-            with_payload: true
-          }))?.points || []
-        : [];
+            withPayload: true
+          });
+          qdrantResults = cloudRes.points || [];
+        } catch (cloudQueryErr: any) {
+          console.warn(
+            `[vectorService] Qdrant Cloud Inference query fallback to numeric ${EMBEDDING_DIMENSION}-d vector:`,
+            cloudQueryErr?.message || cloudQueryErr
+          );
+        }
+      }
+
+      if (qdrantResults.length === 0) {
+        qdrantResults = typeof clientAny.search === 'function'
+          ? await clientAny.search(COLLECTION_NAME, {
+              vector: queryVector,
+              limit: candidateLimit,
+              with_payload: true
+            })
+          : typeof clientAny.query === 'function'
+          ? (await clientAny.query(COLLECTION_NAME, {
+              query: queryVector,
+              limit: candidateLimit,
+              with_payload: true
+            }))?.points || []
+          : [];
+      }
 
       if (qdrantResults && qdrantResults.length > 0) {
         const deduped = new Map<string, VectorSearchResult>();
@@ -812,12 +844,16 @@ export function getVectorStatus(): VectorStatus {
     }
   }
 
+  const activeInfo = getActiveEmbeddingInfo();
+
   return {
     isQdrantConnected: isQdrantReady,
     activeBackend: isQdrantReady ? 'qdrant' : 'local_in_memory',
     collectionName: COLLECTION_NAME,
     totalIndexed: currentCount,
-    url: config.qdrantUrl,
+    url: resolveQdrantEnvConfig().url,
+    embeddingModel: activeInfo.model,
+    cloudInferenceActive: isQdrantReady && isQdrantCloudInferenceEnabled(),
     maxCapacity: maxCap,
     localMaxCapacity: LOCAL_MAX_CAPACITY,
     isQdrantFreeTier: isQdrantReady,
@@ -833,10 +869,11 @@ export function getVectorStatus(): VectorStatus {
     oldestRecordDate: oldestTimestamp ? new Date(oldestTimestamp).toISOString() : undefined,
     schemaVerification: {
       ...cachedSchemaVerification,
+      vectorDimension: activeInfo.dimension,
       totalPoints: currentCount
     },
     offlineFallbackExplanation:
-      'Qdrant is configured on Free Tier with 4 GB disk quota (~4,096 MB). Storage usage is dynamically tracked per vector and clinical payload without an arbitrary point limit. Automated FIFO rollover proactively monitors cluster storage and evicts oldest points at the 85% threshold to guarantee continuous zero-interruption research. If Qdrant is offline, the Node.js dense vector space protects server heap with a 2,000-point FIFO buffer.'
+      'Qdrant is configured on Free Tier with 4 GB disk quota (~4,096 MB) and 384-d sentence-transformers/all-minilm-l6-v2 Cloud Inference. Storage usage is dynamically tracked per vector and clinical payload without an arbitrary point limit. Automated FIFO rollover proactively monitors cluster storage and evicts oldest points at the 85% threshold to guarantee continuous zero-interruption research. If Qdrant is offline, the Node.js 384-d dense vector space protects server heap with a 2,000-point FIFO buffer.'
   };
 }
 

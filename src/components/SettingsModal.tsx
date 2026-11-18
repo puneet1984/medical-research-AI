@@ -86,11 +86,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [omniRouteLlmModel, setOmniRouteLlmModel] = useState('deepseek/deepseek-r1');
 
   // Embeddings & Google Gemini text-embedding-004
-  const [embeddingProvider, setEmbeddingProvider] = useState<'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'>('auto');
+  const [embeddingProvider, setEmbeddingProvider] = useState<'auto' | 'qdrant' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'>('auto');
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [geminiMasked, setGeminiMasked] = useState('');
   const [geminiEmbeddingModel, setGeminiEmbeddingModel] = useState('text-embedding-004');
-  const [openRouterEmbeddingModel, setOpenRouterEmbeddingModel] = useState('openai/text-embedding-3-small');
+  const [openRouterEmbeddingModel, setOpenRouterEmbeddingModel] = useState('sentence-transformers/all-MiniLM-L6-v2');
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('');
   const [huggingFaceMasked, setHuggingFaceMasked] = useState('');
   const [huggingFaceEmbeddingModel, setHuggingFaceEmbeddingModel] = useState('sentence-transformers/all-MiniLM-L6-v2');
@@ -101,7 +101,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [ncbiMasked, setNcbiMasked] = useState('');
 
   // Qdrant Vector DB (URL & API Key)
-  const [qdrantUrl, setQdrantUrl] = useState('http://localhost:6333');
+  const [qdrantUrl, setQdrantUrl] = useState('https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333');
   const [qdrantApiKey, setQdrantApiKey] = useState('');
   const [qdrantMasked, setQdrantMasked] = useState('');
 
@@ -161,14 +161,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setEmbeddingProvider(s.embeddingProvider || 'auto');
         setGeminiMasked(s.geminiApiKeyMasked || '');
         setGeminiEmbeddingModel(s.geminiEmbeddingModel || 'text-embedding-004');
-        setOpenRouterEmbeddingModel(s.openRouterEmbeddingModel || 'openai/text-embedding-3-small');
+        setOpenRouterEmbeddingModel(s.openRouterEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2');
         setHuggingFaceMasked(s.huggingFaceApiKeyMasked || '');
-        setHuggingFaceEmbeddingModel(s.huggingFaceEmbeddingModel || 'monologg/biobert_v1.1_pubmed');
+        setHuggingFaceEmbeddingModel(s.huggingFaceEmbeddingModel || 'sentence-transformers/all-MiniLM-L6-v2');
 
         setScholarlyEmail(s.scholarlyEmail || 'researcher@domain.com');
         setNcbiMasked(s.ncbiApiKeyMasked || '');
 
-        setQdrantUrl(s.qdrantUrl || 'http://localhost:6333');
+        setQdrantUrl(s.qdrantUrl || 'https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333');
         setQdrantMasked(s.qdrantApiKeyMasked || '');
       }
     } catch (err) {
@@ -288,10 +288,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       omniRouteLlmModel: (omniRouteLlmModel || '').trim() || 'deepseek/deepseek-r1',
       embeddingProvider,
       geminiEmbeddingModel: (geminiEmbeddingModel || '').trim() || 'text-embedding-004',
-      openRouterEmbeddingModel: (openRouterEmbeddingModel || '').trim() || 'openai/text-embedding-3-small',
-      huggingFaceEmbeddingModel: (huggingFaceEmbeddingModel || '').trim() || 'monologg/biobert_v1.1_pubmed',
+      openRouterEmbeddingModel: (openRouterEmbeddingModel || '').trim() || 'sentence-transformers/all-MiniLM-L6-v2',
+      huggingFaceEmbeddingModel: (huggingFaceEmbeddingModel || '').trim() || 'sentence-transformers/all-MiniLM-L6-v2',
       scholarlyEmail: (scholarlyEmail || '').trim() || 'researcher@domain.com',
-      qdrantUrl: (qdrantUrl || '').trim() || 'http://localhost:6333'
+      qdrantUrl: (qdrantUrl || '').trim() || 'https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333'
     };
 
     if (geminiApiKey.trim()) payload.geminiApiKey = geminiApiKey.trim();
@@ -793,11 +793,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="flex items-center gap-2">
                 <span className="font-semibold text-slate-700">Active Vector Space:</span>
                 <span className="font-mono text-teal-800 bg-teal-50 px-2 py-0.5 rounded border border-teal-200 font-bold">
-                  {embeddingProvider === 'gemini' ? '768-d • Google text-embedding-004' : embeddingProvider === 'huggingface' ? '768-d • Hugging Face' : embeddingProvider === 'openrouter' ? '768-d • OpenRouter' : '768-d • Auto Aligned'}
+                  {embeddingProvider === 'gemini'
+                    ? '768-d • Google text-embedding-004'
+                    : embeddingProvider === 'huggingface'
+                    ? '384-d / 768-d • Hugging Face'
+                    : embeddingProvider === 'openrouter'
+                    ? '384-d • OpenRouter'
+                    : embeddingProvider === 'local'
+                    ? '384-d • Local MiniLM-Aligned'
+                    : '384-d • Qdrant sentence-transformers/all-minilm-l6-v2'}
                 </span>
               </div>
               <span className="text-[11px] text-slate-500">
-                Uniform dimension guaranteed across Qdrant storage &amp; query retrieval to prevent index mismatch failures
+                Uniform 384-d default guaranteed across Qdrant storage &amp; embedding retrieval to prevent index mismatch failures
               </span>
             </div>
 
@@ -811,11 +819,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   type="text"
                   value={qdrantUrl}
                   onChange={e => setQdrantUrl(e.target.value)}
-                  placeholder="http://localhost:6333"
+                  placeholder="https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-teal-500 focus:outline-none bg-slate-50/50"
                 />
                 <span className="text-[10px] text-slate-400">
-                  Local default: <code className="bg-slate-100 px-1 py-0.5 rounded">http://localhost:6333</code> or Qdrant Cloud URL (<code className="bg-slate-100 px-1 py-0.5 rounded">https://xxxx.us-east-1-0.aws.cloud.qdrant.io:6333</code>)
+                  Default Qdrant Cloud URL or local <code className="bg-slate-100 px-1 py-0.5 rounded">http://localhost:6333</code>
                 </span>
               </div>
 
@@ -1147,11 +1155,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
 
-            <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-4">
+            <div className="grid grid-cols-2 sm:grid-cols-7 gap-2 mb-4">
               {[
-                { id: 'auto', label: 'Auto (Optimal)' },
-                { id: 'local', label: 'Local (100% Free)' },
-                { id: 'gemini', label: 'Gemini (Free Tier)' },
+                { id: 'auto', label: 'Auto (384-d MiniLM)' },
+                { id: 'qdrant', label: 'Qdrant Cloud (384-d)' },
+                { id: 'local', label: 'Local (384-d Free)' },
+                { id: 'gemini', label: 'Gemini (768-d)' },
                 { id: 'ollama', label: 'Ollama (Local)' },
                 { id: 'openrouter', label: 'OpenRouter' },
                 { id: 'huggingface', label: 'Hugging Face' }

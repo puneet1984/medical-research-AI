@@ -320,7 +320,7 @@ export default function App() {
             type="button"
             onClick={() => setIsSettingsOpen(true)}
             className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs shadow-2xs transition-colors cursor-pointer"
-            title={`Active AI Models (Click to configure in Settings):\n• Reasoning: ${activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free'}\n• Synthesis: ${synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free'}\n• Embeddings: ${activeSettings?.embeddingProvider || 'gemini'}`}
+            title={`Active AI Models (Click to configure in Settings):\n• Reasoning: ${activeSettings?.llmReasoningModel || 'baidu/ernie-5.5-flash-preview:free'}\n• Synthesis: ${synthesis?.modelUsed || activeSettings?.llmSynthesisModel || 'nvidia/nemotron-3.5-super-vl:free'}\n• Embeddings: ${activeSettings?.embeddingProvider || 'qdrant (384-d all-minilm-l6-v2)'}`}
           >
             <Cpu className="w-3.5 h-3.5 text-teal-600 shrink-0" />
 

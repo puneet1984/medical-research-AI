@@ -379,8 +379,14 @@ export function handleUpdateSettings(req: Request, res: Response): void {
       resetGeminiClient();
     }
 
-    // If Qdrant settings changed, re-initialize vector connection in background
-    if (updates.qdrantUrl !== undefined || updates.qdrantApiKey !== undefined) {
+    // If Qdrant or embedding provider settings changed, re-initialize vector connection in background
+    if (
+      updates.qdrantUrl !== undefined ||
+      updates.qdrantApiKey !== undefined ||
+      updates.qdrantInferenceModel !== undefined ||
+      updates.qdrantUseCloudInference !== undefined ||
+      updates.embeddingProvider !== undefined
+    ) {
       initQdrant().catch(err => {
         console.warn('[researchController] Qdrant re-init notice:', err);
       });

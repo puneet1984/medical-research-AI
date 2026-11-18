@@ -320,9 +320,18 @@ export async function testConnection(
 ): Promise<{ success: boolean; message: string; details?: unknown }> {
   try {
     if (target === 'qdrant') {
-      const rawUrl = (params?.url || config.qdrantUrl || 'http://localhost:6333').trim();
+      const rawUrl = (
+        params?.url ||
+        config.qdrantUrl ||
+        process.env.QDRANT_URL ||
+        'https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333'
+      ).trim();
       const url = rawUrl.replace(/\/$/, '');
-      const apiKey = params?.apiKey !== undefined ? params.apiKey.trim() : config.qdrantApiKey;
+      const apiKey = (
+        params?.apiKey !== undefined
+          ? params.apiKey
+          : process.env.QDRANT_API_KEY || config.qdrantApiKey || ''
+      ).trim();
 
       const headers: Record<string, string> = {};
       if (apiKey) {

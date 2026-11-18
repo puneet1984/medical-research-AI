@@ -7,6 +7,11 @@ dotenv.config();
 const DATA_DIR = process.env.DATA_DIR || path.resolve(process.cwd(), 'data');
 const SETTINGS_FILE_PATH = path.join(DATA_DIR, 'persistent-settings.json');
 
+export const DEFAULT_QDRANT_CLOUD_URL =
+  'https://bd59148a-dfe3-4984-bcd6-795c770f786d.eu-west-2-0.aws.cloud.qdrant.io:6333';
+export const DEFAULT_QDRANT_INFERENCE_MODEL = 'sentence-transformers/all-minilm-l6-v2';
+export const DEFAULT_VECTOR_DIMENSION = 384;
+
 export const config = {
   port: Number(process.env.PORT) || 5000,
   nodeEnv: process.env.NODE_ENV || 'development',
@@ -25,19 +30,26 @@ export const config = {
   omniRouteUrl: process.env.OMNIROUTE_URL || '',
   omniRouteApiKey: process.env.OMNIROUTE_API_KEY || '',
   omniRouteLlmModel: process.env.OMNIROUTE_LLM_MODEL || 'deepseek/deepseek-r1',
-  // Qdrant vector store
+  // Qdrant vector store (defaults to 384-d Qdrant Cloud Inference)
   qdrantHost: process.env.QDRANT_HOST || 'localhost',
   qdrantPort: Number(process.env.QDRANT_PORT) || 6333,
-  qdrantUrl: process.env.QDRANT_URL || `http://${process.env.QDRANT_HOST || 'localhost'}:${process.env.QDRANT_PORT || 6333}`,
+  qdrantUrl:
+    process.env.QDRANT_URL ||
+    (process.env.QDRANT_HOST
+      ? `http://${process.env.QDRANT_HOST}:${process.env.QDRANT_PORT || 6333}`
+      : DEFAULT_QDRANT_CLOUD_URL),
   qdrantApiKey: process.env.QDRANT_API_KEY || '',
+  qdrantInferenceModel: process.env.QDRANT_INFERENCE_MODEL || DEFAULT_QDRANT_INFERENCE_MODEL,
+  qdrantUseCloudInference: process.env.QDRANT_CLOUD_INFERENCE !== 'false',
+  defaultVectorDimension: Number(process.env.EMBEDDING_DIMENSION) || DEFAULT_VECTOR_DIMENSION,
   // Scholarly APIs
   scholarlyEmail: process.env.SCHOLARLY_USER_AGENT_EMAIL || 'researcher@domain.com',
   ncbiApiKey: process.env.NCBI_API_KEY || '',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   // Embeddings configuration
-  embeddingProvider: process.env.EMBEDDING_PROVIDER || 'auto', // 'auto' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'
+  embeddingProvider: process.env.EMBEDDING_PROVIDER || 'auto', // 'auto' | 'qdrant' | 'gemini' | 'openrouter' | 'huggingface' | 'ollama' | 'local'
   geminiEmbeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004',
-  openRouterEmbeddingModel: process.env.OPENROUTER_EMBEDDING_MODEL || 'openai/text-embedding-3-small',
+  openRouterEmbeddingModel: process.env.OPENROUTER_EMBEDDING_MODEL || 'sentence-transformers/all-MiniLM-L6-v2',
   huggingFaceApiKey: process.env.HUGGINGFACE_API_KEY || '',
   huggingFaceEmbeddingModel: process.env.HUGGINGFACE_EMBEDDING_MODEL || 'sentence-transformers/all-MiniLM-L6-v2'
 };
@@ -59,6 +71,12 @@ function syncScholarlyEnvVars(): void {
   }
   if (config.scholarlyEmail) {
     process.env.SCHOLARLY_USER_AGENT_EMAIL = config.scholarlyEmail;
+  }
+  if (config.qdrantApiKey) {
+    process.env.QDRANT_API_KEY = config.qdrantApiKey;
+  }
+  if (config.qdrantUrl) {
+    process.env.QDRANT_URL = config.qdrantUrl;
   }
 }
 
@@ -115,6 +133,8 @@ export function savePersistentSettings(): void {
       qdrantPort: config.qdrantPort,
       qdrantUrl: config.qdrantUrl,
       qdrantApiKey: config.qdrantApiKey,
+      qdrantInferenceModel: config.qdrantInferenceModel,
+      qdrantUseCloudInference: config.qdrantUseCloudInference,
       scholarlyEmail: config.scholarlyEmail,
       ncbiApiKey: config.ncbiApiKey,
       embeddingProvider: config.embeddingProvider,
@@ -180,8 +200,11 @@ export function getSanitizedConfig() {
     qdrantHost: config.qdrantHost,
     qdrantPort: config.qdrantPort,
     qdrantUrl: config.qdrantUrl,
-    qdrantApiKeyMasked: maskKey(config.qdrantApiKey),
-    isQdrantConfigured: Boolean(config.qdrantApiKey),
+    qdrantApiKeyMasked: maskKey(config.qdrantApiKey || process.env.QDRANT_API_KEY || ''),
+    isQdrantConfigured: Boolean(config.qdrantApiKey || process.env.QDRANT_API_KEY),
+    qdrantInferenceModel: config.qdrantInferenceModel,
+    qdrantUseCloudInference: config.qdrantUseCloudInference,
+    defaultVectorDimension: config.defaultVectorDimension,
     persistentVolumePath: config.settingsFilePath,
     isVolumeMounted: fs.existsSync(DATA_DIR)
   };
